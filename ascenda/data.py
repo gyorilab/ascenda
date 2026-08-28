@@ -48,6 +48,11 @@ class SourceExample:
     source: Optional[str] = None
     split: Optional[str] = None
 
+    def __getattr__(self, name):
+        if name == "source_id":
+            return self.__dict__["doc_id"]
+        raise AttributeError(name)
+
 
 _normalize_id = normalize_id
 _normalize_ids = normalize_ids
@@ -782,3 +787,5 @@ compat_pkg = sys.modules.setdefault(
     "joint_disambig", types.ModuleType("joint_disambig"))
 compat_pkg.data = sys.modules[__name__]
 sys.modules.setdefault("joint_disambig.data", sys.modules[__name__])
+
+DocumentExample = SourceExample  # for pickles that predate the Document-to-Source rename
