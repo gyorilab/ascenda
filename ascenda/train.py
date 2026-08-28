@@ -362,16 +362,13 @@ def train(model, train_dt, val_dt, mention_bank, entity_bank, *, epochs=300, lr=
 
         avg_train = train_loss / max(n_train, 1)
         avg_val = val_loss / max(n_val, 1)
-        gates = (f"bg={float(model.belief_gate.detach()):.3f} "
-                 f"mg={'/'.join(f'{float(r.msg_gate.detach()):.3f}' for r in model.rounds)}"
-                 if len(model.rounds) else "")
-        vx = (f"vrex_var={vrex_var_sum / vrex_var_n:.2e} beta={beta_now:.1f}"
+        vx = (f"vrex_var={vrex_var_sum / vrex_var_n:.2e}  beta={beta_now:.1f}"
               if vrex_var_n else "")
         if vrex_beta > 0 and vrex_erm_windows:
-            vx += f"erm_windows={vrex_erm_windows}"
+            vx += f"  erm_windows={vrex_erm_windows}"
         print(f"Epoch {epoch + 1}/{epochs}  train_loss={avg_train:.4f}  "
-              f"val_loss={avg_val:.4f}{vx}  {format_stats(stats)}  "
-              f"tau={float(model.log_temp.detach().exp()):.4f} {gates}", flush=True)
+              f"val_loss={avg_val:.4f} \n\tv-rex: {vx} \n\tstats: "
+              f"{format_stats(stats)}", flush=True)
 
         # Select on accL (final round accuracy) instead of val_loss
         accl = stats["cL"] / max(stats["n"], 1)
