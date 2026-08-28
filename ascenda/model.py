@@ -1,233 +1,246 @@
-"""Self-attention model for joint candidate scoring."""
+"""Self-attention model for joint candidate scoring.
+"""
 
-from typing import Optional
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-AUX_TYPES = (
-    "Small Molecule", "Biological Function", "Disease", "Tissue/Organ", "Taxon",
-    "Human Gene", "Nonhuman Gene", "Cellular Component", "Cell types/Cell lines",
-    "miRNA",
-)
-AUX_TYPE_IGNORE = -100
 
-BIAS_COLS = [0, 1, 2, 3, 6]
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, hidden_dim, n_heads, dropout):
+class MessageBlock(nn.Module):
+    """One mean-field round of masked self-attention over mention tokens
+    followed by an FFN.
+    """
+    def __init__(self, hidden_dim, n_heads, dropout, msg_gate=0.5):
         super().__init__()
         self.attn = nn.MultiheadAttention(hidden_dim, n_heads, dropout=dropout,
                                           batch_first=True)
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.norm_msg = nn.LayerNorm(hidden_dim)
+        self.norm_ff = nn.LayerNorm(hidden_dim)
+        self.msg_gate = nn.Parameter(torch.tensor(float(msg_gate)))
         self.ff = nn.Sequential(
-            nn.Linear(hidden_dim, 4*hidden_dim),
-            nn.ReLU(),
+            nn.Linear(hidden_dim, 4 * hidden_dim),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(4 * hidden_dim, hidden_dim)
+            nn.Linear(4 * hidden_dim, hidden_dim),
         )
-        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, seq, attn_mask):
-        a, _ = self.attn(seq, seq, seq, attn_mask=attn_mask, need_weights=False)
-        seq = self.norm1(seq + self.dropout(a))
-        return self.norm2(seq + self.ff(seq))
+    def forward(self, u):
+        """Aggregate neighbors into a message.
+        """
+        mask = torch.eye(u.shape[0], dtype=torch.bool, device=u.device)
+        a, _ = self.attn(u.unsqueeze(0), u.unsqueeze(0), u.unsqueeze(0),
+                         attn_mask=mask, need_weights=False)
+        return self.msg_gate * self.norm_ff(self.ff(self.norm_msg(a.squeeze(0))))
 
 
 class JointDisambiguator(nn.Module):
-    """Disambiguates a mention's Gilda candidates by attending to the Gilda candidates
-    of other mentions from the same source (document, experimental dataset, etc.). Each
-    candidate is represented as a numerical vector of [LLM_embedding; gilda_score], which
-    is projected into a lower-dimensional latent space, then passed through a stack of
-    Transformer blocks to let candidates from different mentions inform each other as
-    they're updated. A linear head then produces a scalar score per candidate, and
-    sorting each mention's candidates by that score gives the re-ranked list.
+    """Disambiguates a mention's Gilda candidates by attending to the semantics of other
+    mentions from the same source (document, experimental dataset, etc.). Each
+    mention and candidate is represented as a numerical vector, which is projected into a
+    lower-dimensional latent space, and passed through a stack of attention blocks that
+    allows mentions to update their belief distributions over their candidates using other
+    mentions as context. A learned scoring function then produces a probability
+    distribution over a mention's candidates, from which candidates are re-ranked in
+    order of likelihood, and the argmax is taken as the predicted grounding.
 
-     Params:
-     -------
-     embed_dim :
+    Params:
+    -------
+    embed_dim:
         Dimensionality of LLM embeddings (keep at 768 for PubMedBERT)
-     hidden_dim :
+    hidden_dim:
         Dimensionality of hidden layers
-     n_heads :
+    n_heads:
         Number of attention heads
-     dropout :
+    dropout:
         Dropout rate for training
-    n_cand_features :
-        Number of lexical features used from Gilda for a candidate (6 sub-scores that
-        go into  the Gilda score calculation, and 4 one-hot flags for string match
-        status)
-    context_dim :
-        Dimensionality of the CTX token's embedding (also keep at 768 for PubMedBERT)
-    num_layers :
-        Number of TransformerBlock blocks layered on top of each other
-    feature_skip :
-        If True, re-attach (concatenate) the n_cand_features lexical features to the
-        updated vector representations produced by the num_layers TransformerBlock
-        blocks.
-    aux_type:
-        If True, turn on per-mention entity type prediction as an auxiliary learning
-        task.
-    n_types:
-        Number of entity type classes that the auxiliary prediction head has to choose
-        from.
+    num_rounds:
+        Number of mean-field belief-update rounds after round 0
+    temperature:
+        Initial value of learned temperature param for smoothing or sharpening per-mention
+        beliefs
+    message_temperature:
+        Fixed param for smoothing beliefs passed as messages between mentions
+    msg_gate:
+        Initial value of learned param for how much to weight messages from other
+        mentions into the score.
     """
-
-    wants_context = True
-    wants_candidate_features = True
-
     def __init__(
         self,
         embed_dim: int = 768,
         hidden_dim: int = 128,
         n_heads: int = 4,
         dropout: float = 0.1,
-        n_cand_features=10,
-        context_dim=768,
-        num_layers=3,
-        feature_skip=True,
-        aux_type=True,
-        n_types=len(AUX_TYPES)
+        num_rounds: int = 3,
+        temperature: float = 0.07,
+        message_temperature: float = 0.3,
+        msg_gate: float = 0.5,
     ):
         super().__init__()
         self.embed_dim = embed_dim
-        self.n_cand_features = n_cand_features
-        self.context_dim = context_dim
-        self.num_layers = num_layers
-        self.feature_skip = feature_skip
-        self.aux_type = aux_type
-        self.n_types = n_types
+        self.hidden_dim = hidden_dim
+        self.n_heads = n_heads
+        self.num_rounds = num_rounds
+        self.init_temperature = temperature
+        self.msg_gate_init = msg_gate
+
+        self.mention_proj = nn.Linear(embed_dim, hidden_dim)
+        self.mention_norm = nn.LayerNorm(hidden_dim)
+        self.key_proj = nn.Linear(embed_dim, hidden_dim, bias=False)
+        self.query_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.belief_proj = nn.Linear(hidden_dim, hidden_dim)
         self.dropout = nn.Dropout(dropout)
-        self.input_proj = nn.Linear(embed_dim + n_cand_features, hidden_dim)
-        self.feat_attn_bias = nn.Linear(len(BIAS_COLS), 1)
-        self.ctx_proj = nn.Linear(context_dim, hidden_dim)
+        self.log_temp = nn.Parameter(torch.tensor(math.log(temperature)))
 
-        self.blocks = nn.ModuleList([
-            TransformerBlock(hidden_dim, n_heads, dropout)
-            for _ in range(num_layers)])
-        self.score_head = nn.Linear(
-            hidden_dim + (n_cand_features if feature_skip else 0), 1)
-        if aux_type:
-            self.type_head = nn.Linear(hidden_dim, n_types)
+        self.message_temperature = message_temperature
+        self.belief_norm = nn.LayerNorm(hidden_dim)
+        self.belief_gate = nn.Parameter(torch.tensor(1.0))
 
-    def _trunk(self, embeddings, context_emb, mention_ids=None):
-        """Handles the sending of the CTX and candidate embeddings through
-        TransformerBlock blocks. Returns updated candidate representations and
-        the updated CTX representation when applicable.
+        self.ctx_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.ctx_gate = nn.Linear(2 * hidden_dim, 1)
+
+        self.rounds = nn.ModuleList([
+            MessageBlock(hidden_dim, n_heads, dropout, msg_gate)
+            for _ in range(num_rounds)])
+
+    def get_pairwise_sim(self, h, keys, msg=None, return_parts=False):
+        """Returns match scores for candidates based on vector similarity. Returns
+        all parts of the score when return_parts=True.
         """
-        N = embeddings.shape[0]
-        feats_b = embeddings[:, self.embed_dim:][:, BIAS_COLS]
-        x = self.dropout(F.relu(self.input_proj(embeddings)))
-        key_bias = self.feat_attn_bias(feats_b).squeeze(-1)
-        cross_block = (mention_ids.unsqueeze(0) != mention_ids.unsqueeze(1)
-                       if mention_ids is not None else None)
+        q = F.normalize(self.query_proj(h), dim=-1)
+        local = torch.einsum("md,mcd->mc", q, keys)
+        if msg is None:
+            return (local, local, None, None) if return_parts else local
+        qc = F.normalize(self.ctx_proj(msg), dim=-1)
+        ctx = torch.einsum("md,mcd->mc", qc, keys)
+        gate = torch.sigmoid(self.ctx_gate(torch.cat([h, msg], dim=-1)))
+        total = local + gate * ctx
+        return (total, local, ctx, gate) if return_parts else total
 
-        if context_emb is None:
-            attn_mask = key_bias.unsqueeze(0).expand(N, N).clone()
-            if cross_block is not None:
-                attn_mask = attn_mask.masked_fill(cross_block, float("-inf"))
-            seq = x.unsqueeze(0)
-            for blk in self.blocks:
-                seq = blk(seq, attn_mask)
-            return seq.squeeze(0), None
-
-        ctx = F.relu(self.ctx_proj(context_emb.view(1, -1)))
-        seq = torch.cat([ctx, x], dim=0).unsqueeze(0)
-        full_bias = torch.cat([torch.zeros(1, device=key_bias.device), key_bias])
-        attn_mask = full_bias.unsqueeze(0).expand(1 + N, 1 + N).clone()
-        if cross_block is not None:
-            blocked = torch.zeros(1 + N, 1 + N, dtype=torch.bool,
-                                  device=cross_block.device)
-            blocked[1:, 1:] = cross_block
-            attn_mask = attn_mask.masked_fill(blocked, float("-inf"))
-        for blk in self.blocks:
-            seq = blk(seq, attn_mask)
-        out = seq.squeeze(0)
-        return out[1:], out[0]
-
-    def _score(self, x, embeddings):
-        """Handles the scoring of candidates based on their updated representations (and
-        their lexical features if self.feature_skip is True).
+    def get_ctx_log_probs(self, msg, keys, cand_mask):
+        """Returns per-mention log-beliefs (log probs over candidates) from the context
+        term alone (msg).
         """
-        if self.feature_skip:
-            x = torch.cat([x, embeddings[:, self.embed_dim:]], dim=-1)
-        return self.score_head(x).squeeze(-1)
+        qc = F.normalize(self.ctx_proj(msg), dim=-1)
+        logits = (torch.einsum("md,mcd->mc", qc, keys)
+                  / self.log_temp.exp().clamp(min=1e-2))
+        return F.log_softmax(logits.masked_fill(~cand_mask, float("-inf")), dim=1)
 
-    def forward(self, embeddings, context_emb=None, return_hidden=False,
-                mention_ids=None):
-        """Calls self._trunk and self._score to facilitate a forward pass.
+    def get_score(self, h, keys, cand_mask, msg=None):
+        """Returns log-beliefs tensor of size (M, C) at the learned scoring
+        temperature.
         """
-        x, ctx_hidden = self._trunk(embeddings, context_emb, mention_ids)
-        scores = self._score(x, embeddings)
-        return (scores, x, ctx_hidden) if return_hidden else scores
+        logits = self.get_pairwise_sim(h, keys, msg) / self.log_temp.exp().clamp(min=1e-2)
+        return F.log_softmax(logits.masked_fill(~cand_mask, float("-inf")), dim=1)
 
-    def compute_aux_loss(self, x, mention_ids, type_targets, w_type=0.2):
-        """Per-mention cross-entropy loss for entity type prediction. Best `w_type` was
-        found to be 0.2 based on validation loss.
+    def get_belief(self, h, keys, cand_mask, msg=None):
+        """Returns log-beliefs tensor of size (M, C) at the fixed scoring
+        temperature (message_temperature). Builds the distribution that's passed
+        between mentions.
         """
-        if not (self.aux_type and w_type > 0 and type_targets is not None
-                and (type_targets != AUX_TYPE_IGNORE).any()):
-            return x.new_zeros(())
-        M = int(mention_ids.max().item()) + 1
-        pooled = x.new_zeros(M, x.size(1)).index_add_(0, mention_ids, x)
-        counts = x.new_zeros(M).index_add_(
-            0, mention_ids, x.new_ones(mention_ids.shape[0]))
-        pooled = pooled / counts.clamp(min=1.0).unsqueeze(1)
-        return w_type * F.cross_entropy(self.type_head(pooled), type_targets,
-                                        ignore_index=AUX_TYPE_IGNORE)
+        sim = self.get_pairwise_sim(h, keys, msg) / self.message_temperature
+        return F.softmax(sim.masked_fill(~cand_mask, float("-inf")), dim=1)
+
+    def get_keys(self, cand_emb, cand_mask):
+        """Returns key vectors for candidate embeddings.
+        """
+        keys = F.normalize(self.key_proj(cand_emb), dim=-1)
+        return keys.masked_fill(~cand_mask.unsqueeze(-1), 0.0)
+
+    def run_rounds(self, h0, keys, cand_mask):
+        """Runs the message rounds. Returns (msg, per-round log-beliefs) for each
+        mention.
+        """
+        log_probs = [self.get_score(h0, keys, cand_mask)]
+        msg = None
+        if h0.shape[0] >= 2:
+            for i in range(self.num_rounds):
+                belief = self.get_belief(h0, keys, cand_mask, msg)
+                e = (belief.unsqueeze(-1) * keys).sum(dim=1)
+                u = h0 + self.belief_gate * self.belief_norm(self.belief_proj(e))
+                msg = self.rounds[i](u)
+                log_probs.append(self.get_score(h0, keys, cand_mask, msg))
+        return msg, log_probs
+
+    def forward(self, mention_emb, cand_emb, cand_mask, return_all=False,
+                return_aux=False):
+        """Calls self-contained methods to facilitate a forward pass.
+
+        Params:
+        -------
+        mention_emb:
+            Mention embeddings
+        cand_emb:
+            Candidate embeddings
+        cand_mask:
+            True where a candidate is real
+        return_all:
+            If True, return the per-round output (for deep supervision). Otherwise, return
+            the final round's output.
+        return_aux:
+            If True, also return components that go into the `ctx` and `orth` objective fn terms.
+
+        Returns:
+        --------
+        torch.Tensor (M, C) of final log-beliefs if return_all and return_aux are False.
+        """
+        keys = self.get_keys(cand_emb, cand_mask)
+        h0 = self.mention_norm(self.dropout(self.mention_proj(mention_emb)))
+        msg, log_probs = self.run_rounds(h0, keys, cand_mask)
+
+        result = log_probs if return_all else log_probs[-1]
+        if not return_aux:
+            return result
+        aux = {"msg": msg, "q_loc": F.normalize(self.query_proj(h0), dim=-1),
+               "q_ctx": None, "ctx_log_prob": None}
+        if msg is not None:
+            aux["q_ctx"] = F.normalize(self.ctx_proj(msg), dim=-1)
+            aux["ctx_log_prob"] = self.get_ctx_log_probs(msg, keys, cand_mask)
+        return result, aux
+
+    @torch.no_grad()
+    def score_parts(self, mention_emb, cand_emb, cand_mask):
+        """Returns the different parts of the candidate score as the tuple (total,
+        local, ctx, gate):
+            total: the overall score
+            local: what the mention's own text wanted (vector similarity with mention)
+            ctx: what the other mentions' wanted (vector similarity with source context)
+            gate: how much the other mentions' preferences were weighted
+        """
+        keys = self.get_keys(cand_emb, cand_mask)
+        h0 = self.mention_norm(self.mention_proj(mention_emb))
+        msg, _ = self.run_rounds(h0, keys, cand_mask)
+        return self.get_pairwise_sim(h0, keys, msg, return_parts=True)
 
 
-def compute_loss(
-    scores: torch.Tensor,
-    mention_ids: torch.Tensor,
-    gold_indices: torch.Tensor,
-    temperature: float = 1.0,
-    weights: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Computes per-mention cross-entropy loss averaged over mentions whose gold
-     is reachable.
+def compute_loss(log_probs, pos_mask, round_weights=None):
+    """Per-mention negative log-likelihood (NLL) averaged over mentions whose gold is
+    reachable.
 
-    Params:
+    Params
+    ------
+    log_probs: list[(M, C)]
+        Log-beliefs from each round.
+    pos_mask: (M, C) bool
+        True at every correct candidate. A mention with no reachable correct candidate
+        is excluded from the loss.
+    round_weights: list[float] or None
+        How to weight log-beliefs from each round. Defaults to uniform over rounds.
+
+    Returns
     -------
-    scores : (N,)
-        Raw model scores for all candidates.
-    mention_ids : (N,)
-        Specifies which mention each candidate belongs to.
-    gold_indices : (M,)
-        The index of the correct candidate within each mention's candidates. A
-        value of -1 means the true grounding isn't in the candidate list and that
-        mention's candidates are excluded from the loss.
-    temperature : float
-        Denominator that divides model scores before the softmax to sharpen the
-        distribution (when < 1), which restores gradient magnitude if the scores have
-        a narrow range. Ranking within a mention is invariant to this, so evaluation is
-        unaffected and only the training gradients change. Default is 1.0.
-    weights : (M,) or None
-        Per-mention loss weights for class rebalancing
-        
-    Returns:
-    --------
-    loss : scalar torch.Tensor
+    loss: scalar torch.Tensor loss, and the number of mentions that contributed.
     """
-    losses, ws = [], []
-    for m_id in range(gold_indices.shape[0]):
-        gold_idx = gold_indices[m_id].item()
-        if gold_idx < 0:
-            continue
-        mention_scores = scores[mention_ids == m_id]
-        if mention_scores.shape[0] == 0:
-            continue
-        log_probs = F.log_softmax(mention_scores / temperature, dim=0)
-        losses.append(-log_probs[gold_idx])
-        if weights is not None:
-            ws.append(weights[m_id])
-    if not losses:
-        return torch.tensor(0.0, requires_grad=True, device=scores.device)
-    stacked = torch.stack(losses)
-    if weights is None:
-        return stacked.mean()
-    w = torch.stack(ws).to(stacked.dtype)
-    return (stacked * w).sum() / w.sum().clamp_min(1e-8)
+    trainable = pos_mask.any(dim=1)
+    n = int(trainable.sum())
+    if n == 0:
+        return log_probs[-1].exp().sum() * 0.0, 0
+    if round_weights is None:
+        round_weights = [1.0 / len(log_probs)] * len(log_probs)
+
+    total = log_probs[-1].new_zeros(())
+    for w, lp in zip(round_weights, log_probs):
+        masked = lp.masked_fill(~pos_mask, float("-inf"))[trainable]
+        total = total + w * (-torch.logsumexp(masked, dim=1)).mean()
+    return total, n
