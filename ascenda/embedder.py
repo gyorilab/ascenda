@@ -1,4 +1,5 @@
-"""Use a pretrained PubMedBERT model from HuggingFace to embed gilda candidates."""
+"""Use a pretrained PubMedBERT model from HuggingFace to embed gilda candidates.
+"""
 import os
 import pickle
 from typing import Optional
@@ -78,14 +79,14 @@ class DescriptionLookup:
 _description_lookup: Optional[DescriptionLookup] = None
 
 
-def _get_description_lookup(grounder) -> DescriptionLookup:
+def get_description_lookup(grounder) -> DescriptionLookup:
     global _description_lookup
     if _description_lookup is None:
         _description_lookup = DescriptionLookup(grounder)
     return _description_lookup
 
 
-def _build_embedding_text(term, grounder=None) -> str:
+def build_embedding_text(term, grounder=None) -> str:
     """Build a rich text string for embedding a Gilda Term. For example,
     instead of embedding a candidate like HGNC:3467 by only its entry_name
     "ESR1", embed a string that includes this name plus a long-form name
@@ -108,7 +109,7 @@ def _build_embedding_text(term, grounder=None) -> str:
     if grounder is None:
         return name
 
-    lookup = _get_description_lookup(grounder)
+    lookup = get_description_lookup(grounder)
     parts = [name]
 
     # Add descriptive name if available
@@ -194,7 +195,7 @@ class CandidateEmbedder:
         """
         key = (term.db, term.id)
         if key not in self._cache:
-            text = _build_embedding_text(term, self.grounder)
+            text = build_embedding_text(term, self.grounder)
             self._cache[key] = self.embed_text(text)
         return self._cache[key]
 
