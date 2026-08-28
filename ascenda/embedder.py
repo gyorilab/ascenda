@@ -129,18 +129,18 @@ def build_embedding_text(term, grounder=None) -> str:
     return ", ".join(parts)
 
 
-class CandidateEmbedder:
-    """Embeds Gilda candidate entities using a pretrained LLM.
+class EntityEmbedder:
+    """Embeds entity mentions and candidates using a pretrained LLM.
 
     Params:
     -------
-    model_name :
+    model_name:
         HuggingFace model identifier. Default is PubMedBERT (now known as BiomedBERT).
-    device :
+    device:
         'cpu', 'mps', or 'cuda'.
-    cache_path :
+    cache_path:
         Optional embedding cache location
-    grounder :
+    grounder:
         Optional Gilda Grounder instance for looking up full entity names
         from the term table. If provided, allows for embedding richer entity texts
         (e.g., "ESR1, estrogen receptor 1 (gene)" instead of "ESR1").
