@@ -1,31 +1,14 @@
 import numpy as np
 import torch
-from .embedder import CandidateEmbedder, _build_embedding_text
 
-
-_STATUS_IDX = {"curated": 0, "name": 1, "synonym": 2, "former_name": 3}
-
-def match_feature_vector(c):
-    """Return a 10-d feature vector for a ScoredMatch with 4 dims dedicated for
-    status one-hot encoding and 6 dims for normalized string sub-scores from c.match.
-    """
-    m = c.match
-    status = [0.0, 0.0, 0.0, 0.0]
-    si = _STATUS_IDX.get(getattr(c.term, "status", None))
-    if si is not None:
-        status[si] = 1.0
-    return status + [
-        m.score_short_abbr() / 1.0,
-        m.score_mixed() / 2.0,
-        m.score_exact() / 1.0,
-        m.score_acic() / 2.0,
-        m.score_combo() / 6.0,
-        m.score_dash() / 2.0,
-    ]
+from .embedder import EntityEmbedder, build_embedding_text
+from .train import (ENTITY_MAX_LENGTH, MENTION_MAX_LENGTH,
+                              embed_strings_meanpool)
 
 
 class JointReranker(object):
-    """Jointly re-ranks ScoredMatch lists from multiple ground() calls.
+    """Jointly re-ranks ScoredMatch lists from multiple ground() calls. All lists
+    should come from the same source.
     """
     def __init__(self, model, grounder=None, device="cpu", cache=None,
                  embedder=None):
@@ -34,11 +17,12 @@ class JointReranker(object):
         self._embedder = embedder
         self.device = device
         self.cache = dict(cache or {})
+        self.mention_cache = {}
 
     @property
     def embedder(self):
         if self._embedder is None:
-            self._embedder = CandidateEmbedder(device=self.device,
+            self._embedder = EntityEmbedder(device=self.device,
                                                grounder=self.grounder)
         return self._embedder
 
@@ -48,88 +32,97 @@ class JointReranker(object):
         from .train import load_model
         return cls(load_model(path, device=device), grounder, device, cache)
 
-    def _embed(self, terms):
-        """Embed a batch of terms that haven't been embedded yet (aren't in the cache). Takes
-        a list of terms as input.
+    def embed_candidates(self, candidates):
+        """Embed a batch of candidates that aren't in the entity cache yet. Takes a list of
+        candidates as input. Uses [CLS] pooling.
         """
-        new = [t for t in terms if (t.db, t.id) not in self.cache]
+        new, seen = [], set()
+        for c in candidates:
+            key = (c.db, c.id)
+            if key not in self.cache and key not in seen:
+                seen.add(key)
+                new.append(c)
         if new:
-            # Get embedding text for each new term
-            texts = [_build_embedding_text(t, self.embedder.grounder) for t in new]
+            # Get embedding text for each new candidate
+            texts = [build_embedding_text(c, self.embedder.grounder) for c in new]
+            vecs = self.embedder.embed_texts(texts, batch_size=64,
+                                             max_length=ENTITY_MAX_LENGTH)
+            # Embed each new candidate and add to the cache
+            for c, v in zip(new, vecs):
+                self.cache[(c.db, c.id)] = np.asarray(v, dtype="float32")
 
-            # Embed each new term and add to the cache
-            for t, v in zip(new, self.embedder.embed_texts(texts, batch_size=64)):
-                self.cache[(t.db, t.id)] = v
-
-    def build_model_tensors(self, candidate_lists):
-        """Builds tensors needed by the model from list of ScoredMatch lists.
+    def embed_mentions(self, texts):
+        """Embed a batch of mentions that aren't in the entity cache yet. Takes a list of
+        terms as input. Uses mean pooling instead of [CLS] pooling.
         """
-        embs, scores, m_ids, gate_feats = [], [], [], []
-        m_id = 0
+        new = list(dict.fromkeys(t for t in texts if t not in self.mention_cache))
+        if new:
+            vecs = embed_strings_meanpool(self.embedder, new,
+                                           max_length=MENTION_MAX_LENGTH)
+            for t, v in zip(new, vecs):
+                self.mention_cache[t] = np.asarray(v, dtype="float32")
 
-        # Get everything the model needs
-        for cands in candidate_lists:
-            if not cands:
-                continue
-            # 1. Embed any new candidates not already in the cache
-            self._embed([c.term for c in cands])
+    def build_model_tensors(self, mention_texts, candidate_lists):
+        """Build the three tensors the model expects from lists of mention surface
+        strings and their ScoredMatch lists.
 
-            # 2. Build lists
-            use_feats = getattr(self.model, "wants_candidate_features", False)
-            for c in cands:
-                emb = self.cache[(c.term.db, c.term.id)]  # embedding from cache
-                if use_feats:  # append Gilda score ingredients
-                    emb = np.concatenate(
-                        [emb, np.asarray(match_feature_vector(c), dtype=emb.dtype)])
-                embs.append(emb)
-                scores.append(c.score)  # Gilda score
-                m_ids.append(m_id)  # unique id
-
-            # Get top candidate features for input to confidence gate MLP
-            top_score = cands[0].score
-            gate_feats.append([top_score - cands[1].score if len(cands) > 1 else top_score,
-                               len(cands), top_score])
-            m_id += 1
-
-        if not embs:
+        Returns the tuple (mention_emb (M, 768), cand_emb (M, C, 768), cand_mask
+        (M, C) bool), or None when no mention has any candidate.
+        """
+        rows = [(t, c) for t, c in zip(mention_texts, candidate_lists) if c]
+        if not rows:
             return None
 
-        # tensorize since that's what the model expects
-        embs_tensor = torch.tensor(np.stack(embs), dtype=torch.float32, device=self.device)
-        scores_tensor = torch.tensor(scores, dtype=torch.float32, device=self.device).unsqueeze(-1)  # add a dim
-        m_ids_tensor = torch.tensor(m_ids, dtype=torch.long, device=self.device)
-        gate_feats_tensor = torch.tensor(gate_feats, dtype=torch.float32, device=self.device)
+        # 1. Embed new mentions and candidates not already in the cache
+        self.embed_mentions([t for t, _ in rows])
+        for _, cands in rows:
+            self.embed_candidates([c.term for c in cands])
 
-        return embs_tensor, scores_tensor, m_ids_tensor, gate_feats_tensor
+        # 2. Build tensors
+        M = len(rows)
+        C = max(len(c) for _, c in rows)
+        dim = self.model.embed_dim
 
-    def rerank(self, candidate_lists, context_emb=None):
-        """Re-ranks a list[list[ScoredMatch]] object with a provided model. Returns another
-        list[list[ScoredMatch]] object. context_emb is a 1d document-context vector.
+        mention_emb = np.stack([self.mention_cache[t] for t, _ in rows])
+        cand_emb = np.zeros((M, C, dim), dtype="float32")
+        cand_mask = torch.zeros(M, C, dtype=torch.bool)
+        for i, (_, cands) in enumerate(rows):
+            for j, c in enumerate(cands):
+                cand_emb[i, j] = self.cache[(c.term.db, c.term.id)]  # embedding from cache
+            cand_mask[i, :len(cands)] = True
+
+        return (
+            torch.as_tensor(mention_emb, dtype=torch.float32, device=self.device),
+            torch.as_tensor(cand_emb, dtype=torch.float32, device=self.device),
+            cand_mask.to(self.device),
+        )
+
+    def rerank(self, candidate_lists, mention_texts):
+        """Re-rank a list[list[ScoredMatch]] object jointly. Returns another
+        list[list[ScoredMatch]] object in the same order.
+
+        `mention_texts` is parallel to `candidate_lists` and their lengths should
+        match. They should also come from the same source.
         """
         # Build the tensors the model needs from candidate_lists
-        model_tensors = self.build_model_tensors(candidate_lists)
+        model_tensors = self.build_model_tensors(mention_texts, candidate_lists)
         if model_tensors is None:
-            return candidate_lists
+            return list(candidate_lists)
 
         # Run model and unpack output
-        embs, _, _, _ = model_tensors
-        ctx = None
-        if context_emb is not None:
-            ctx = torch.as_tensor(context_emb, dtype=torch.float32,
-                                  device=self.device)
+        mention_emb, cand_emb, cand_mask = model_tensors
         self.model.eval()
         with torch.no_grad():
-            out = self.model(embs, context_emb=ctx).cpu().numpy()
+            log_prob = self.model(mention_emb, cand_emb, cand_mask).cpu().numpy()
 
         ranked = []
-        i = 0  # need i since "out" is a flat list (array) but candidate_lists isn't
+        i = 0  # need i since "log_prob" is a flat list (array) but candidate_lists isn't
         for cands in candidate_lists:
             if not cands:
                 ranked.append(cands)
                 continue
-            n = len(cands)
-            order = np.argsort(-out[i:i + n])
-            i += n
+            order = np.argsort(-log_prob[i, :len(cands)])
+            i += 1
             ranked.append([cands[k] for k in order])
 
         return ranked
