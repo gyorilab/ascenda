@@ -4,99 +4,185 @@ disambiguation.
 import copy
 import os
 import pickle
-from typing import Optional
 import numpy as np
 import torch
 import collections
 import random
 
-from .data import DocumentExample, NS_TYPE
-from .embedder import CandidateEmbedder, _build_embedding_text, DEFAULT_MODEL
-from .model import JointDisambiguator, compute_loss, AUX_TYPES, AUX_TYPE_IGNORE
-from .rerank import JointReranker
-from gilda import Grounder
+from .data import NS_TYPE, load_corpus, make_splits
+from .embedder import (EntityEmbedder, DEFAULT_MODEL, ORGANISM_NAMES,
+                       build_embedding_text)
+from .model import JointDisambiguator, compute_loss
+from .tensors import build_banks, build_doc_tensors, gather
+
+DEFAULT_DATASETS = ["bioid", "bc5cdr", "nlmchem", "ncbi_disease", "gnormplus",
+                    "medmentions_st21pv"]
+
+# Make sure the caches resolve regardless of the working directory
+_PKG = os.path.dirname(os.path.abspath(__file__))
+_CACHES = os.path.join(_PKG, "caches")
+DEFAULT_CORPUS_CACHE = os.path.join(_CACHES, "corpus_cache", "final_merged.pkl")
+DEFAULT_ENTITY_CACHE = os.path.join(_CACHES, "entity_embeddings_final.pkl")
+DEFAULT_MENTION_CACHE = os.path.join(_CACHES, "mention_embeddings_final.pkl")
+DEFAULT_OUTPUT = os.path.join(_PKG, "models", "model.pt")
+
+# Imported by rerank.py
+ENTITY_MAX_LENGTH = 64
+MENTION_MAX_LENGTH = 64
 
 
-def precompute_embeddings(
-    docs: list[DocumentExample],
-    embedder: CandidateEmbedder,
-    cache_path: Optional[str] = None,
-) -> dict[tuple[str, str], np.ndarray]:
-    """Embed all unique candidates across all documents in a corpus and cache
-    to disk. Returns a dict that maps (db, id) keys to 1d embedding vectors.
+# === For building embeddings ===
+
+@torch.no_grad()
+def embed_strings_meanpool(enc: EntityEmbedder, texts, batch_size=64,
+                            max_length=MENTION_MAX_LENGTH) -> np.ndarray:
+    """Returns vector embeddings for mention strings, mean-pooled over all non-padding
+    tokens, by passing them through a frozen pre-trained PubMedBERT encoder.
+    """
+    out = []
+    for i in range(0, len(texts), batch_size):
+        tok = enc.tokenizer(texts[i:i + batch_size], padding=True, truncation=True,
+                            max_length=max_length, return_tensors="pt").to(enc.device)
+        hid = enc.model(**tok).last_hidden_state
+        m = tok["attention_mask"].unsqueeze(-1).to(hid.dtype)
+        out.append(((hid * m).sum(1) / m.sum(1).clamp(min=1)).cpu().numpy())
+    return np.concatenate(out, axis=0).astype("float32")
+
+
+def get_canonical_term(docs):
+    """Create dict so that there's only one term per (db, id).
+    """
+    best = {}
+    for d in docs:
+        for m in d.mentions:
+            for c in m.candidates or ():
+                t = c.term
+                key = (t.db, t.id)
+                rank = (t.organism in ORGANISM_NAMES, t.entry_name or "",
+                        t.text or "", t.status or "")
+                if key not in best or rank > best[key][0]:
+                    best[key] = (rank, t)
+    return {k: v[1] for k, v in best.items()}
+
+
+def precompute_candidate_vectors(docs, cache_path, device="cpu") -> dict:
+    """Returns the dict {(db, id): float32[768]} of PubMedBERT embeddings for candidates.
     """
     if cache_path and os.path.exists(cache_path):
         with open(cache_path, "rb") as f:
             cache = pickle.load(f)
-        print(f"Loaded {len(cache)} cached embeddings from {cache_path}")
+        print(f"Loaded {len(cache)} entity embeddings from {cache_path}")
         return cache
 
-    # Build the dict of unique candidate keys and embedding text values
-    unique = {}
-    for doc in docs:
-        for m in doc.mentions:
-            for cand in m.candidates:
-                key = (cand.term.db, cand.term.id)
-                if key not in unique:
-                    unique[key] = _build_embedding_text(cand.term,
-                                                        embedder.grounder)
-
-    # Get embeddings for each candidate key using batches
-    keys = list(unique.keys())
-    texts = [unique[k] for k in keys]
+    from gilda.grounder import Grounder
+    enc = EntityEmbedder(model_name=DEFAULT_MODEL, device=device, grounder=Grounder())
+    terms = get_canonical_term(docs)
+    ids = sorted(terms)
+    texts = [build_embedding_text(terms[k], enc.grounder) for k in ids]
     print(f"Embedding {len(texts)} unique candidates...")
-    vectors = embedder.embed_texts(texts, batch_size=64)
-    cache = {k: vectors[i] for i, k in enumerate(keys)}
+    vecs = enc.embed_texts(texts, batch_size=64, max_length=ENTITY_MAX_LENGTH)
+    cache = {k: np.asarray(v, dtype="float32") for k, v in zip(ids, vecs)}
 
     if cache_path:
         os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
         with open(cache_path, "wb") as f:
             pickle.dump(cache, f)
-        print(f"Saved embedding cache to {cache_path}")
+        print(f"Saved embeddings to {cache_path}")
     return cache
 
 
-def precompute_context_embeddings(
-    docs: list[DocumentExample],
-    embedder: CandidateEmbedder,
-    cache_path: Optional[str] = None,
-    max_length: int = 512,
-) -> dict[str, np.ndarray]:
-    """Embed one context string per document.
+def precompute_mention_vectors(docs, device="cpu") -> dict:
+    """Returns the dict {(doc_id, mention_idx): float32[768]} of PubMedBERT embeddings
+    for entity mentions.
     """
-    if cache_path and os.path.exists(cache_path):
-        with open(cache_path, "rb") as f:
+    if os.path.exists(DEFAULT_MENTION_CACHE):
+        with open(DEFAULT_MENTION_CACHE, "rb") as f:
             cache = pickle.load(f)
-        print(f"Loaded {len(cache)} cached context embeddings from {cache_path}")
+        print(f"Loaded {len(cache)} mention embeddings from {DEFAULT_MENTION_CACHE}")
         return cache
 
-    ids, strings = [], []
-    for doc in docs:
-        seen = list(dict.fromkeys(m.text for m in doc.mentions))
-        ids.append(doc.doc_id)
-        strings.append(", ".join(seen))
-    print(f"Embedding {len(strings)} document-context strings...")
-    vectors = embedder.embed_texts(strings, batch_size=32, max_length=max_length)
-    cache = {doc_id: vectors[i] for i, doc_id in enumerate(ids)}
+    need = {}
+    for d in docs:
+        for i, m in enumerate(d.mentions):
+            if m.candidates:
+                need.setdefault(m.text, []).append((d.doc_id, i))
 
-    if cache_path:
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump(cache, f)
-        print(f"Saved context cache to {cache_path}")
-    return cache
+    out = {}
+    if need:
+        texts = list(need)
+        n = sum(len(v) for v in need.values())
+        print(f"Embedding {len(texts)} unique surface strings for {n} mentions...")
+        enc = EntityEmbedder(model_name=DEFAULT_MODEL, device=device)
+        for t, v in zip(texts, embed_strings_meanpool(enc, texts)):
+            for k in need[t]:
+                out[k] = v
+    print(f"Mention embeddings: {len(out)}")
+
+    os.makedirs(os.path.dirname(DEFAULT_MENTION_CACHE) or ".", exist_ok=True)
+    with open(DEFAULT_MENTION_CACHE, "wb") as f:
+        pickle.dump(out, f)
+    print(f"Saved mention embeddings to {DEFAULT_MENTION_CACHE}")
+    return out
 
 
-def _context_tensor(context_cache, doc_id, device):
-    """Look up a doc's context vector and tensorize it.
+def model_forward(model, dt, mention_bank, entity_bank, device, return_aux=False):
+    """Pass one source through the model with deep supervision on always.
     """
-    if not context_cache:
-        return None
-    v = context_cache.get(doc_id)
-    return torch.tensor(v, dtype=torch.float32, device=device) if v is not None else None
+    return model(*gather(dt, mention_bank, entity_bank, device),
+                 return_all=True, return_aux=return_aux)
 
 
-def _env_labels(docs, ns_purity=0.5):
+# === For training stats ===
+
+def accumulate_stats(stats, log_probs, dt, aux=None):
+    """Update stats on mentions that are reachable.
+    """
+    sel = dt.pos_mask.any(dim=1) & (dt.n_cand > 1)
+    if not bool(sel.any()):
+        return
+    pos = dt.pos_mask[sel]
+    first, last = log_probs[0].detach().cpu()[sel], log_probs[-1].detach().cpu()[sel]
+    a0, aL = first.argmax(1), last.argmax(1)
+    ok0 = pos.gather(1, a0.unsqueeze(1)).squeeze(1)
+    okL = pos.gather(1, aL.unsqueeze(1)).squeeze(1)
+    stats["n"] += int(sel.sum())
+    stats["c0"] += int(ok0.sum())
+    stats["cL"] += int(okL.sum())
+    stats["flip"] += int((a0 != aL).sum())
+    stats["gain"] += int((~ok0 & okL).sum())
+    stats["loss"] += int((ok0 & ~okL).sum())
+    stats["nw"] += int((~ok0).sum())
+    if aux is not None and aux.get("ctx_log_prob") is not None:
+        ca = aux["ctx_log_prob"].detach().cpu()[sel].argmax(1)
+        stats["cctx"] += int(pos.gather(1, ca.unsqueeze(1)).sum())
+        stats["nctx"] += int(sel.sum())
+    for tag, lp in (("h0", first), ("hL", last)):
+        p = lp.exp()
+        stats[tag] += float(-(p * lp.clamp(min=-30)).sum(1).sum())
+
+
+def format_stats(stats):
+    n = max(stats["n"], 1)
+    gl = stats["gain"] + stats["loss"]
+    ctxacc = (f"ctxacc={stats['cctx'] / max(stats['nctx'], 1):.4f} "
+              if stats["nctx"] else "")
+    return (f"acc0={stats['c0'] / n:.4f} accL={stats['cL'] / n:.4f} "
+            f"flip={stats['flip'] / n:.4f} "
+            f"fprec={stats['gain'] / max(gl, 1):.4f} "
+            f"addr={stats['gain'] / max(stats['nw'], 1):.4f} "
+            f"gain/loss={stats['gain']}/{stats['loss']} "
+            f"{ctxacc}"
+            f"H0={stats['h0'] / n:.3f} HL={stats['hL'] / n:.3f} n={stats['n']}")
+
+
+def get_new_stats():
+    return {"n": 0, "c0": 0, "cL": 0, "flip": 0, "h0": 0.0, "hL": 0.0,
+            "gain": 0, "loss": 0, "nw": 0, "cctx": 0, "nctx": 0}
+
+
+# === For model training ===
+
+def get_env_labels(docs, ns_purity=0.5):
     """Give each document an environment label based on the composition of its gold
     namespaces. For implementing the Variance Risk Extrapolation (V-REx) method.
 
@@ -120,62 +206,49 @@ def _env_labels(docs, ns_purity=0.5):
     return out
 
 
-def train(
-    train_docs: list[DocumentExample],
-    val_docs: list[DocumentExample],
-    embedding_cache: dict,
-    model: JointDisambiguator,
-    grounder: Grounder,
-    *,
-    epochs: int = 120,
-    lr: float = 5e-5,
-    weight_decay: float = 0.0,
-    grad_accum: int = 8,
-    seed: int = 0,
-    patience: int = 20,
-    device: str = "cpu",
-    context_cache: Optional[dict] = None,
-    aux_type_weight: float = 0.0,
-    vrex_beta: float = 0.0,
-    vrex_warmup: int = 5,
-    vrex_min_docs: int = 50,
-    vrex_ns_purity: float = 0.5,
-) -> JointDisambiguator:
-    """Train with early stopping on validation loss and return the best checkpoint.
-    `context_cache` feeds the per-document CTX token and should always be supplied.
+def get_round_weights(n_out, round0_weight):
+    """Get weights for each message-passing belief-update round.
     """
-    if not val_docs:
-        raise ValueError("val_docs is empty")
+    if n_out == 1:
+        return [1.0]
+    return [round0_weight] + [(1.0 - round0_weight) / (n_out - 1)] * (n_out - 1)
 
+
+def train(model, train_dt, val_dt, mention_bank, entity_bank, *, epochs=300, lr=3e-4,
+          weight_decay=0.01, grad_accum=8, patience=20, seed=0, device="cpu",
+          deep_supervision=True, round0_weight=0.2, w_ctx=0.0,
+          w_orth=0.0, env_of=None, vrex_beta=0.0, vrex_warmup=5, vrex_min_docs=50):
     device = torch.device(device)
-    jr = JointReranker(model, grounder, device=device, cache=embedding_cache)
+    model = model.to(device)
+    mention_bank = mention_bank.to(device)
+    entity_bank = entity_bank.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    best_val_loss = float("inf")
+    best_accl = -1.0
     best_state = None
     patience_counter = 0
     rng = random.Random(seed)
-    type_to_id = {t: i for i, t in enumerate(AUX_TYPES)}
-    use_aux = aux_type_weight > 0
 
     # Establish V-REx environments. Keep those with >= `vrex_min_docs`, drop 'ns:none'.
     # Dropped environments still contribute to the mean risk, but not variance risk.
-    env_of = _env_labels(train_docs, vrex_ns_purity)
-    _env_n = collections.Counter(env_of[d.doc_id] for d in train_docs)
-    _env_n.pop("ns:none", None)
-    vrex_envs = {k for k, c in _env_n.items() if c >= vrex_min_docs}
+    vrex_envs = set()
     if vrex_beta > 0:
-        print(f"[v-rex] beta={vrex_beta}  warmup={vrex_warmup} epochs  "
-              f"purity={vrex_ns_purity}")
+        if env_of is None:
+            raise ValueError("vrex_beta > 0 requires env_of")
+        env_n = collections.Counter(env_of[dt.doc_id] for dt in train_dt)
+        env_n.pop("ns:none", None)
+        vrex_envs = {k for k, c in env_n.items() if c >= vrex_min_docs}
+        print(f"[v-rex] beta={vrex_beta} warmup={vrex_warmup} "
+              f"min_docs={vrex_min_docs}")
         print(f"[v-rex] {len(vrex_envs)} environments kept: "
-              + ", ".join(f"{k}({_env_n[k]})" for k, _ in _env_n.most_common()
+              + ", ".join(f"{k}({env_n[k]})" for k, _ in env_n.most_common()
                           if k in vrex_envs))
-        dropped = [k for k in _env_n if k not in vrex_envs]
+        dropped = [k for k in env_n if k not in vrex_envs]
         if dropped:
-            print(f"[v-rex] dropped (< {vrex_min_docs} docs): "
-                  + ", ".join(f"{k}({_env_n[k]})" for k in dropped))
+            print(f"[v-rex] dropped (<{vrex_min_docs} docs): "
+                  + ", ".join(f"{k}({env_n[k]})" for k in dropped))
 
-    def _vrex_penalty(win, beta_now):
+    def penalize_vrex(win, beta_now):
         """Applies the V-REx penalty to the objective for one 'batch' of documents.
 
         Returns the tuple (objective, variance) for one gradient-accumulation window
@@ -196,9 +269,10 @@ def train(
     for epoch in range(epochs):
         # --- train ---
         model.train()
+        optimizer.zero_grad()
+
         train_loss = 0.0
         n_train = 0
-        optimizer.zero_grad()
         accum = 0
         window = []
         vrex_var_sum = 0.0
@@ -207,65 +281,65 @@ def train(
         beta_now = vrex_beta * min(1.0, (epoch + 1) / max(vrex_warmup, 1))
 
         # Shuffle to decorrelate batches
-        docs_order = list(train_docs)
-        rng.shuffle(docs_order)
+        order = list(train_dt)
+        rng.shuffle(order)
 
-        for doc in docs_order:
-            tensors = jr.build_model_tensors([m.candidates for m in doc.mentions])
-            if tensors is None:
-                continue
-            embs, gs, mids, gate_feats = tensors
-            with_cands = [m for m in doc.mentions if m.candidates]
-            golds = torch.tensor(
-                [m.gold_index if m.gold_index is not None else -1 for m in with_cands],
-                dtype=torch.long, device=device)
-            ctx = _context_tensor(context_cache, doc.doc_id, device)
-            if use_aux:
-                scores, x_hidden, _ctx_hidden = jr.model(
-                    embs, context_emb=ctx, return_hidden=True)
+        for dt in order:
+            need_aux = w_ctx > 0 or w_orth > 0
+            if need_aux:
+                log_probs, aux = model_forward(model, dt, mention_bank, entity_bank, device,
+                                      return_aux=True)
             else:
-                scores = jr.model(embs, context_emb=ctx)
-            loss = compute_loss(scores, mids, golds)
-            if use_aux:
-                type_t = torch.tensor(
-                    [type_to_id.get(m.entity_type, AUX_TYPE_IGNORE) for m in with_cands],
-                    dtype=torch.long, device=device)
-                loss = loss + jr.model.compute_aux_loss(
-                    x_hidden, mids, type_t, aux_type_weight)
-            if loss.item() == 0.0:
+                log_probs, aux = model_forward(model, dt, mention_bank, entity_bank, device), None
+            if not deep_supervision:
+                log_probs = [log_probs[-1]]
+            loss, n = compute_loss(log_probs, dt.pos_mask.to(device),
+                                   get_round_weights(len(log_probs), round0_weight))
+            if n == 0:
                 continue
-            train_loss += loss.item()
+            if aux is not None and aux.get("ctx_log_prob") is not None:
+                # ctx_loss is like the contribution of other mentions to disambiguation
+                if w_ctx > 0:
+                    ctx_loss, ctx_n = compute_loss([aux["ctx_log_prob"]], dt.pos_mask.to(device))
+                    if ctx_n:
+                        loss = loss + w_ctx * ctx_loss
+                # w_orth * cosine_sim is a penalty that encourages the contribution of
+                # other mentions to be different from the contribution of the focal mention.
+                # --> prevents them from converging on the same information.
+                if w_orth > 0:
+                    cosine_sim = (aux["q_loc"] * aux["q_ctx"]).sum(-1).abs().mean()
+                    loss = loss + w_orth * cosine_sim
+            train_loss += loss.detach().item()
             n_train += 1
+            accum += 1
 
             # --- apply variance penalty ---
             if vrex_beta > 0:  # i.e., if vrex is ON
-                window.append((env_of[doc.doc_id], loss))
-                accum += 1
+                window.append((env_of[dt.doc_id], loss))
                 if accum < grad_accum:
                     continue
-                total, v = _vrex_penalty(window, beta_now)
+                total, v = penalize_vrex(window, beta_now)
                 if v is None:
                     vrex_erm_windows += 1
                 else:
                     vrex_var_sum += float(v.detach())
                     vrex_var_n += 1
                 total.backward()
-                optimizer.step()
-                optimizer.zero_grad()
-                accum = 0
-                window = []
-                continue
+            else:
+                (loss / grad_accum).backward()
+                if accum < grad_accum:
+                    continue
 
-            (loss / grad_accum).backward()
-            accum += 1
-            if accum == grad_accum:
-                optimizer.step()
-                optimizer.zero_grad()
-                accum = 0
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            accum = 0
+            window = []
 
         if accum > 0:
             if vrex_beta > 0 and window:
                 torch.stack([l for _, l in window]).mean().backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
             window = []
@@ -274,39 +348,41 @@ def train(
         model.eval()
         val_loss = 0.0
         n_val = 0
+        stats = get_new_stats()
         with torch.no_grad():
-            for doc in val_docs:
-                tensors = jr.build_model_tensors([m.candidates for m in doc.mentions])
-                if tensors is None:
+            for dt in val_dt:
+                log_probs, aux = model_forward(model, dt, mention_bank, entity_bank, device,
+                                      return_aux=True)
+                loss, n = compute_loss([log_probs[-1]], dt.pos_mask.to(device))
+                if n == 0:
                     continue
-                embs, gs, mids, gate_feats = tensors
-                with_cands = [m for m in doc.mentions if m.candidates]
-                golds = torch.tensor(
-                    [m.gold_index if m.gold_index is not None else -1
-                     for m in with_cands],
-                    dtype=torch.long, device=device)
-                ctx = _context_tensor(context_cache, doc.doc_id, device)
-                scores = jr.model(embs, context_emb=ctx)
-                val_loss += compute_loss(scores, mids, golds).item()
+                val_loss += loss.item()
                 n_val += 1
+                accumulate_stats(stats, log_probs, dt, aux)
 
         avg_train = train_loss / max(n_train, 1)
         avg_val = val_loss / max(n_val, 1)
+        gates = (f"bg={float(model.belief_gate.detach()):.3f} "
+                 f"mg={'/'.join(f'{float(r.msg_gate.detach()):.3f}' for r in model.rounds)}"
+                 if len(model.rounds) else "")
         vx = (f"vrex_var={vrex_var_sum / vrex_var_n:.2e} beta={beta_now:.1f}"
               if vrex_var_n else "")
         if vrex_beta > 0 and vrex_erm_windows:
             vx += f"erm_windows={vrex_erm_windows}"
-        print(f"Epoch {epoch+1}/{epochs}  train_loss={avg_train:.4f}  "
-              f"val_loss={avg_val:.4f}{vx}")
+        print(f"Epoch {epoch + 1}/{epochs}  train_loss={avg_train:.4f}  "
+              f"val_loss={avg_val:.4f}{vx}  {format_stats(stats)}  "
+              f"tau={float(model.log_temp.detach().exp()):.4f} {gates}", flush=True)
 
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
+        # Select on accL (final round accuracy) instead of val_loss
+        accl = stats["cL"] / max(stats["n"], 1)
+        if accl > best_accl:
+            best_accl = accl
             best_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch+1}")
+                print(f"Early stopping at epoch {epoch + 1}")
                 break
 
     if best_state is not None:
@@ -314,132 +390,103 @@ def train(
     return model
 
 
-_rerankers = {}
+@torch.no_grad()
+def evaluate(model, doc_tensors, mention_bank, entity_bank, device="cpu"):
+    device = torch.device(device)
+    model = model.to(device).eval()
+    stats = get_new_stats()
+    for dt in doc_tensors:
+        log_probs, aux = model_forward(model, dt, mention_bank, entity_bank, device,
+                              return_aux=True)
+        accumulate_stats(stats, log_probs, dt, aux)
+    return stats
 
-def _get_reranker(model, embedding_cache, device):
+
+def save_model(model, path, train_config=None):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save({
+        "state_dict": model.state_dict(),
+        "model_type": type(model).__name__,
+        "config": {
+            "embed_dim": model.embed_dim,
+            "hidden_dim": model.hidden_dim,
+            "n_heads": model.n_heads,
+            "dropout": model.dropout.p,
+            "num_rounds": model.num_rounds,
+            "temperature": model.init_temperature,
+            "message_temperature": model.message_temperature,
+            "msg_gate": model.msg_gate_init,
+        },
+        **({"train_config": train_config} if train_config else {}),
+    }, path)
+    print(f"Model saved to {path}")
+
+
+def load_model(path, device="cpu") -> JointDisambiguator:
+    ckpt = torch.load(path, map_location=device, weights_only=True)
+    model = JointDisambiguator(**ckpt["config"])
+    model.load_state_dict(ckpt["state_dict"], strict=True)
+    model.eval()
+    return model
+
+
+
+rerankers = {}
+
+def get_reranker(model, entity_cache, device):
     """Build once and reuse a JointReranker per (model, device) so the cache doesn't
     get duplicated and PubMedBERT is only loaded once.
     """
+    from .rerank import JointReranker
     key = (id(model), str(device))
-    jr = _rerankers.get(key)
+    jr = rerankers.get(key)
     if jr is None:
         jr = JointReranker(model, grounder=None, device=device,
-                           cache=embedding_cache)
-        _rerankers[key] = jr
+                               cache=entity_cache)
+        rerankers[key] = jr
     return jr
 
 
-def predict_document(
-        doc: DocumentExample,
-        embedding_cache: dict,
-        model: JointDisambiguator,
-        device: str = "cpu",
-        context_cache: Optional[dict] = None,
-) -> dict[str, list]:
-    """Run inference on a single document and return {mention_text: re-ranked
-    ScoredMatch list}. `context_cache` feeds the document-context token.
+def predict_source(doc, entity_cache: dict, model, device: str = "cpu") -> dict:
+    """Run inference on a single source and return {mention_text: re-ranked
+    ScoredMatch list}.
     """
-    jr = _get_reranker(model, embedding_cache, device)
+    jr = get_reranker(model, entity_cache, device)
     with_cands = [m for m in doc.mentions if m.candidates]
-    ctx = _context_tensor(context_cache, doc.doc_id, device)
     ranked = jr.rerank([m.candidates for m in with_cands],
-                       context_emb=ctx) if with_cands else []
+                       [m.text for m in with_cands]) if with_cands else []
     results = {m.text: r for m, r in zip(with_cands, ranked)}
     for m in doc.mentions:
         results.setdefault(m.text, m.candidates)
     return results
 
 
-# Checkpoints trained before the model.py rewrite have 10 extra config keys
-# (the disabled aux heads, pre_norm, n_namespaces, n_coarse, defn_dim) for
-# architecture variants that were deprecated. Need this list of keys for
-# loading the model.
-_MODEL_CONFIG_KEYS = {"embed_dim", "hidden_dim", "n_heads", "dropout",
-                      "n_cand_features", "context_dim", "num_layers",
-                      "feature_skip", "aux_type", "n_types"}
-
-# `model_type` values used before the model.py rewrite. There is now one
-# architecture (JointDisambiguator), so this is just a safety guard. Need this list
-# of keys for loading the model.
-_KNOWN_MODEL_TYPES = {"JointDisambiguator", "MultiLayerCtxUngatedDisambiguator"}
-
-# Checkpoints trained before the model.py rewrite also have a now-deprecated
-# `attention.*` key in the model_state dict. Need this for loading the model.
-_DEAD_STATE_PREFIXES = ("attention.",)
-
-
-def save_model(model: JointDisambiguator, path: str,
-               embedding_mode: str = "rich",
-               train_config: Optional[dict] = None):
-    """Save model checkpoint to disk with model type and embedding mode
-    metadata.
-    """
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    torch.save({
-        "state_dict": model.state_dict(),
-        "model_type": type(model).__name__,
-         "config": {
-            "embed_dim": model.embed_dim,
-            "hidden_dim": model.input_proj.out_features,
-            "n_heads": model.blocks[0].attn.num_heads,
-            "dropout": model.dropout.p,
-            "n_cand_features": model.n_cand_features,
-            "context_dim": model.context_dim,
-            "num_layers": model.num_layers,
-            "feature_skip": model.feature_skip,
-            "aux_type": model.aux_type,
-            "n_types": model.n_types,
-        },
-        "embedding_mode": embedding_mode,
-        **({"train_config": train_config} if train_config else {}),
-    }, path)
-
-
-def load_model(path: str, device: str = "cpu") -> JointDisambiguator:
-    """Load a saved model checkpoint from disk.
-    """
-    ckpt = torch.load(path, map_location=device, weights_only=True)
-    model_type = ckpt.get("model_type", "JointDisambiguator")
-    if model_type not in _KNOWN_MODEL_TYPES:
-        raise ValueError(
-            f"{path!r} was trained with an invalid model_type ({model_type!r}). Choose "
-            f"one of {sorted(_KNOWN_MODEL_TYPES)}.")
-    config = {k: v for k, v in ckpt["config"].items() if k in _MODEL_CONFIG_KEYS}
-    state = {k: v for k, v in ckpt["state_dict"].items()
-             if not k.startswith(_DEAD_STATE_PREFIXES)}
-    model = JointDisambiguator(**config)
-    model.load_state_dict(state)
-    model.eval()
-    return model
-
 
 
 if __name__ == "__main__":
     import argparse
-    import json
 
     parser = argparse.ArgumentParser(
         description="Train joint disambiguation model")
-    parser.add_argument("--epochs", type=int, default=120)
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--patience", type=int, default=20)
-    parser.add_argument("--grad-accum", type=int, default=8,
-                        help="documents per optimizer step (effective batch size in docs)")
-    parser.add_argument("--weight-decay", type=float, default=0.0,
-                        help="AdamW weight decay")
+    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--hidden-dim", type=int, default=128,
-                        help="hidden layer width")
+    parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--num-layers", type=int, default=3,
-                        help="number of stacked transformer blocks")
-    parser.add_argument("--feature-skip", action="store_true",
-                        help="if True, concatenate raw candidate features onto the "
-                             "post-trunk rep. before the score head")
-    parser.add_argument("--aux-type-weight", type=float, default=0.0,
-                        help="weight of loss term from per-mention entity-type prediction")
-    parser.add_argument("--vrex-beta", type=float, default=0.0,
+    parser.add_argument("--rounds", type=int, default=3,
+                   help="mean-field rounds after round 0")
+    parser.add_argument("--temperature", type=float, default=0.07)
+    parser.add_argument("--no-deep-supervision", action="store_true")
+    parser.add_argument("--round0-weight", type=float, default=0.2)
+    parser.add_argument("--message-temperature", type=float, default=0.3,
+                   help="Fixed temperature for the belief that feeds the messages")
+    parser.add_argument("--msg-gate", type=float, default=0.5,
+                   help="initial mix of message into the state; reported each epoch")
+    parser.add_argument("--vrex-beta", type=float, default=10.0,
                         help="coefficient for V-REx penalty in loss")
     parser.add_argument("--vrex-warmup", type=int, default=5,
                         help="epochs over which beta ramps linearly from 0")
@@ -450,71 +497,61 @@ if __name__ == "__main__":
                         help="share of a document's labeled mentions the argmax gold "
                              "type must hold for the document to be assigned to that "
                              "environment instead of ns:mixed")
-    parser.add_argument("--datasets", nargs="+", default=["bioid"],
-                        help="sources to combine, e.g. 'bioid bc5cdr nlmchem "
-                             "ncbi_disease'. Default is 'bioid' (original pipeline).")
-    parser.add_argument("--corpus-cache", default=None,
-                        help="path to cache or load the merged corpus pickle "
-                             "(skips re-grounding on re-runs).")
-    parser.add_argument("--embedding-cache",
-                        default="ascenda/embedding_cache_tier2.pkl")
-    parser.add_argument("--context-cache", default=None,
-                        help="path to/for the per-document CTX embedding cache")
-    parser.add_argument("--equivalences", default=None,
-                        help="path to equivalences.json")
+    parser.add_argument("--w-ctx", type=float, default=0.5,
+                   help="weight on the context-only ranking loss: require the trunk to "
+                        "disambiguate with no mention-text query (additive mode only)")
+    parser.add_argument("--w-orth", type=float, default=0.1,
+                   help="weight on |cos(q_ctx, q_loc)|: require what the trunk adds to "
+                        "be orthogonal to what the mention's own text already says")
+    parser.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS)
+    parser.add_argument("--corpus-cache", default=DEFAULT_CORPUS_CACHE,
+                   help="v2 gold. The v1 set in caches/corpus_cache/ belongs to the "
+                        "older model and is not comparable.")
+    parser.add_argument("--embedding-cache", default=DEFAULT_ENTITY_CACHE)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--output", default="ascenda/model_checkpoint.pt")
+    parser.add_argument("--output", default=DEFAULT_OUTPUT)
     args = parser.parse_args()
 
-    from .data import load_corpus, make_splits, report_statistics
-
-    equivalences = {}
-    if args.equivalences and os.path.exists(args.equivalences):
-        with open(args.equivalences) as f:
-            equivalences = json.load(f)
-
-    grounder = Grounder()
-    docs = load_corpus(args.datasets, grounder=grounder,
-                       equivalences=equivalences,
-                       merged_cache=args.corpus_cache)
-    report_statistics(docs)
-    train_docs, val_docs, test_docs = make_splits(docs)
-    print(f"Split: {len(train_docs)} train, {len(val_docs)} val, "
-          f"{len(test_docs)} test")
-
-    # Rich embeddings (pass grounder for full names + species labels)
-    embedder = CandidateEmbedder(model_name=DEFAULT_MODEL,
-                                 device=args.device, grounder=grounder)
-    cache = precompute_embeddings(train_docs + val_docs + test_docs,
-                                  embedder, args.embedding_cache)
-    ctx_cache = precompute_context_embeddings(train_docs + val_docs + test_docs,
-                                              embedder, args.context_cache)
-
     torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+    docs = load_corpus(args.datasets, merged_cache=args.corpus_cache)
+    train_docs, val_docs, test_docs = make_splits(docs)
+    print(f"docs: {len(train_docs)} train / {len(val_docs)} val / {len(test_docs)} test")
+
+    mention_vecs = precompute_mention_vectors(docs, device=args.device)
+    embedding_cache = precompute_candidate_vectors(docs, args.embedding_cache, device=args.device)
+
+    mention_bank, entity_bank, entity_row, mention_row = build_banks(
+        mention_vecs, embedding_cache)
+    print(f"banks: mentions {tuple(mention_bank.shape)}  "
+          f"entities {tuple(entity_bank.shape)}")
+
+    train_dt = build_doc_tensors(train_docs, entity_row, mention_row)
+    val_dt = build_doc_tensors(val_docs, entity_row, mention_row)
+    test_dt = build_doc_tensors(test_docs, entity_row, mention_row)
+    trainable = sum(int((dt.pos_mask.any(1) & (dt.n_cand > 1)).sum()) for dt in train_dt)
+    print(f"doc tensors: {len(train_dt)}/{len(val_dt)}/{len(test_dt)}; "
+          f"{trainable} reachable multi-candidate train mentions")
+
     model = JointDisambiguator(
-        embed_dim=embedder.embed_dim, hidden_dim=args.hidden_dim,
-        n_heads=args.n_heads, dropout=args.dropout,
-        num_layers=args.num_layers, feature_skip=args.feature_skip,
-        aux_type=args.aux_type_weight > 0, n_types=len(AUX_TYPES))
+        hidden_dim=args.hidden_dim, n_heads=args.n_heads, dropout=args.dropout,
+        num_rounds=args.rounds, temperature=args.temperature,
+        message_temperature=args.message_temperature, msg_gate=args.msg_gate)
+    print(f"params: {sum(p.numel() for p in model.parameters()):,}")
 
-    model = train(
-        train_docs, val_docs, cache, model, grounder,
-        epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
-        grad_accum=args.grad_accum, seed=args.seed, patience=args.patience,
-        device=args.device, context_cache=ctx_cache,
-        aux_type_weight=args.aux_type_weight,
-        vrex_beta=args.vrex_beta, vrex_warmup=args.vrex_warmup,
-        vrex_min_docs=args.vrex_min_docs, vrex_ns_purity=args.vrex_ns_purity,
-    )
+    model = train(model, train_dt, val_dt, mention_bank, entity_bank,
+                  epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+                  grad_accum=args.grad_accum, patience=args.patience, seed=args.seed,
+                  device=args.device, deep_supervision=not args.no_deep_supervision,
+                  round0_weight=args.round0_weight,
+                  env_of=(get_env_labels(train_docs, args.vrex_ns_purity)
+                          if args.vrex_beta > 0 else None),
+                  vrex_beta=args.vrex_beta, vrex_warmup=args.vrex_warmup,
+                  vrex_min_docs=args.vrex_min_docs, w_ctx=args.w_ctx, w_orth=args.w_orth)
 
-    save_model(model, args.output, embedding_mode="rich", train_config={
-        "epochs": args.epochs, "lr": args.lr, "weight_decay": args.weight_decay,
-        "grad_accum": args.grad_accum, "seed": args.seed, "patience": args.patience,
-        "dropout": args.dropout, "num_layers": args.num_layers,
-        "feature_skip": args.feature_skip, "datasets": args.datasets,
-        "aux_type_weight": args.aux_type_weight,
-        "vrex_beta": args.vrex_beta, "vrex_warmup": args.vrex_warmup,
-        "vrex_min_docs": args.vrex_min_docs, "vrex_ns_purity": args.vrex_ns_purity,
-        "encoder_model": DEFAULT_MODEL,
-    })
-    print(f"Model saved to {args.output}")
+    for name, dts in (("val", val_dt), ("test", test_dt)):
+        print(f"FINAL {name}: {format_stats(evaluate(model, dts, mention_bank, entity_bank, args.device))}")
+
+    save_model(model, args.output, train_config={**vars(args)})
