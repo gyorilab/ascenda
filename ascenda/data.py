@@ -40,10 +40,10 @@ class MentionExample:
 
 
 @dataclass
-class DocumentExample:
-    """For all mentions from one document, forming one training example
+class SourceExample:
+    """For all mentions from one source, forming one training example
     """
-    doc_id: str
+    source_id: str
     mentions: list = field(default_factory=list)
     source: Optional[str] = None
     split: Optional[str] = None
@@ -88,8 +88,8 @@ def assign_gold_index(mention: MentionExample) -> None:
 def load_bioid_corpus(
     grounder: Optional[Grounder] = None,
     equivalences: Optional[dict] = None,
-) -> list[DocumentExample]:
-    """Load the BioCreative BioID corpus as a DocumentExample list.
+) -> list[SourceExample]:
+    """Load the BioCreative BioID corpus as a SourceExample list.
 
     Params:
     ------
@@ -100,8 +100,8 @@ def load_bioid_corpus(
         
     Returns:
     --------
-    list[DocumentExample]
-        A list containing DocumentExample objects, each representing a document 
+    list[SourceExample]
+        A list containing SourceExample objects, each representing a Source
         with its mentions and associated disambiguation information.
     """
 
@@ -122,11 +122,11 @@ def load_bioid_corpus(
     )
     df = df[df["entity_type"] != "other"]
 
-    print("Generating Gilda candidates per document...")
-    documents = []
-    for doc_id, group in tqdm(df.groupby("don_article"), desc="Documents"):
-        organisms = benchmarker._get_organism_priority(doc_id)
-        doc = DocumentExample(doc_id=str(doc_id))
+    print("Generating Gilda candidates per source...")
+    sources = []
+    for source_id, group in tqdm(df.groupby("don_article"), desc="Sources"):
+        organisms = benchmarker._get_organism_priority(source_id)
+        source = SourceExample(source_id=str(source_id))
         seen_texts: dict[str, MentionExample] = {}
         for _, row in group.iterrows():
             text = row["text"]
@@ -147,13 +147,13 @@ def load_bioid_corpus(
                 existing.gold_synonyms.update(row["obj_synonyms"])
                 if existing.gold_index is None:
                     assign_gold_index(existing)
-        doc.mentions = list(seen_texts.values())
-        if doc.mentions:
-            documents.append(doc)
+        source.mentions = list(seen_texts.values())
+        if source.mentions:
+            sources.append(source)
 
-    print(f"Loaded {len(documents)} documents with "
-          f"{sum(len(d.mentions) for d in documents)} unique mentions.")
-    return documents
+    print(f"Loaded {len(sources)} sources with "
+          f"{sum(len(d.mentions) for d in sources)} unique mentions.")
+    return sources
 
 
 # === BigBio data loading ===
@@ -167,9 +167,9 @@ def load_bigbio_corpus(
         exclude_types=("CompositeMention",),
         umls_crosswalk: Optional[dict] = None,
         drop_other: bool = False,
-) -> list[DocumentExample]:
+) -> list[SourceExample]:
     """Load one BigBio dataset from its flattened parquet mention table into a
-    DocumentExample list like load_bioid_corpus.
+    SourceExample list like load_bioid_corpus.
 
     drop_other: if True, skip mentions classified as "other" (e.g. MedMentions
     TUIs outside _UMLS_TUI_GROUP). Default is False.
@@ -177,10 +177,10 @@ def load_bigbio_corpus(
     import pickle
     if cache_path and os.path.exists(cache_path):
         with open(cache_path, "rb") as f:
-            docs = pickle.load(f)
-        print(f"Loaded cached {dataset_name} corpus ({len(docs)} docs) "
+            sources = pickle.load(f)
+        print(f"Loaded cached {dataset_name} corpus ({len(sources)} sources) "
               f"from {cache_path}")
-        return docs
+        return sources
 
     if grounder is None:
         grounder = Grounder()
@@ -196,11 +196,11 @@ def load_bigbio_corpus(
             print(f"{dataset_name}: excluded {dropped} mentions of "
                   f"types {sorted(excl)}")
 
-    documents = []
-    for doc_id, group in tqdm(mentions_df.groupby("document_id"),
-                              desc=f"{dataset_name} docs"):
+    sources = []
+    for source_id, group in tqdm(mentions_df.groupby("source_id"),
+                              desc=f"{dataset_name} sources"):
         split = str(group["split"].iloc[0])
-        doc = DocumentExample(doc_id=str(doc_id), source=dataset_name, split=split)
+        source = SourceExample(source_id=str(source_id), source=dataset_name, split=split)
         for _, row in group.iterrows():
             db_ids = list(row["db_ids"])
             type_list = list(row["type"])
@@ -225,20 +225,20 @@ def load_bigbio_corpus(
                 source_datasets={dataset_name},
             )
             assign_gold_index(mention)
-            doc.mentions.append(mention)
+            source.mentions.append(mention)
 
-        if doc.mentions:
-            documents.append(doc)
+        if source.mentions:
+            sources.append(source)
 
-    print(f"{dataset_name}: {len(documents)} docs, "
-          f"{sum(len(d.mentions) for d in documents)} mentions")
+    print(f"{dataset_name}: {len(sources)} sources, "
+          f"{sum(len(d.mentions) for d in sources)} mentions")
 
     if cache_path:
         os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
         with open(cache_path, "wb") as f:
-            pickle.dump(documents, f)
+            pickle.dump(sources, f)
         print(f"Cached {dataset_name} corpus to {cache_path}")
-    return documents
+    return sources
 
 
 # === For single corpus building ===
@@ -256,7 +256,7 @@ def load_corpus(
         merged_cache: Optional[str] = None,
         top_k: int = 20,
         dedup: bool = True,
-) -> list[DocumentExample]:
+) -> list[SourceExample]:
     """Build a combined corpus from one or more sources.
     """
     import pickle
@@ -268,9 +268,9 @@ def load_corpus(
             os.path.dirname(os.path.abspath(__file__)), "caches", "corpus_cache")
     if merged_cache and os.path.exists(merged_cache):
         with open(merged_cache, "rb") as f:
-            docs = pickle.load(f)
-        print(f"Loaded merged corpus ({len(docs)} docs) from {merged_cache}")
-        return docs
+            sources = pickle.load(f)
+        print(f"Loaded merged corpus ({len(sources)} sources) from {merged_cache}")
+        return sources
 
     if grounder is None:
         grounder = Grounder()
@@ -289,53 +289,53 @@ def load_corpus(
             umls_crosswalk = {k: set(v) for k, v in json.load(f).items()}
         print(f"Loaded UMLS crosswalk ({len(umls_crosswalk)} CUIs)")
 
-    all_docs: list[DocumentExample] = []
+    all_sources: list[SourceExample] = []
     for name in datasets:
         if name == "bioid":
-            bioid_docs = load_bioid_corpus(grounder=grounder, equivalences=equivalences)
-            train, val, test = split_by_document(bioid_docs)
+            bioid_sources = load_bioid_corpus(grounder=grounder, equivalences=equivalences)
+            train, val, test = split_by_source(bioid_sources)
             for d in train:
                 d.source, d.split = "bioid", "train"
             for d in val:
                 d.source, d.split = "bioid", "validation"
             for d in test:
                 d.source, d.split = "bioid", "test"
-            all_docs.extend(bioid_docs)
+            all_sources.extend(bioid_sources)
         else:
             import pandas as pd
             path = os.path.join(parquet_dir, f"{name}.parquet")
             df = pd.read_parquet(path)
             cache_path = os.path.join(corpus_cache_dir, f"{name}.pkl")
-            docs = load_bigbio_corpus(name, df, grounder=grounder,
+            sources = load_bigbio_corpus(name, df, grounder=grounder,
                                       equivalences=equivalences, top_k=top_k,
                                       umls_crosswalk=umls_crosswalk,
                                       cache_path=cache_path)
-            all_docs.extend(docs)
+            all_sources.extend(sources)
 
     if dedup:
-        all_docs = resolve_cross_dataset_overlap(all_docs)
+        all_sources = resolve_cross_dataset_overlap(all_sources)
 
-    print(f"Combined corpus: {len(all_docs)} docs, "
-          f"{sum(len(d.mentions) for d in all_docs)} mentions")
+    print(f"Combined corpus: {len(all_sources)} sources, "
+          f"{sum(len(d.mentions) for d in all_sources)} mentions")
     if merged_cache:
         os.makedirs(os.path.dirname(merged_cache) or ".", exist_ok=True)
         with open(merged_cache, "wb") as f:
-            pickle.dump(all_docs, f)
+            pickle.dump(all_sources, f)
         print(f"Cached merged corpus to {merged_cache}")
 
-    return all_docs
+    return all_sources
 
 
 # === For the train/val/test split ===
 
-def split_by_document(
-    examples: list[DocumentExample],
+def split_by_source(
+    examples: list[SourceExample],
     train: float = 0.7,
     val: float = 0.15,
     test: float = 0.15,
     seed: int = 42,
-) -> tuple[list[DocumentExample], list[DocumentExample], list[DocumentExample]]:
-    """Split at document level for joint disambiguation
+) -> tuple[list[SourceExample], list[SourceExample], list[SourceExample]]:
+    """Split at source level for joint disambiguation
     """
     rng = random.Random(seed)
     indices = list(range(len(examples)))
@@ -343,22 +343,22 @@ def split_by_document(
     n = len(indices)
     n_train = int(n * train)
     n_val = int(n * val)
-    train_docs = [examples[i] for i in indices[:n_train]]
-    val_docs = [examples[i] for i in indices[n_train : n_train + n_val]]
-    test_docs = [examples[i] for i in indices[n_train + n_val :]]
-    return train_docs, val_docs, test_docs
+    train_sources = [examples[i] for i in indices[:n_train]]
+    val_sources = [examples[i] for i in indices[n_train : n_train + n_val]]
+    test_sources = [examples[i] for i in indices[n_train + n_val :]]
+    return train_sources, val_sources, test_sources
 
 
-def make_splits(docs):
-    """Partition a corpus into train, validation, and test sets by each document's
+def make_splits(sources):
+    """Partition a corpus into train, validation, and test sets by each source's
     assigned split.
     """
-    train = [d for d in docs if d.split == "train"]
-    val = [d for d in docs if d.split == "validation"]
-    test = [d for d in docs if d.split == "test"]
-    unsplit = [d for d in docs if d.split not in ("train", "validation", "test")]
+    train = [d for d in sources if d.split == "train"]
+    val = [d for d in sources if d.split == "validation"]
+    test = [d for d in sources if d.split == "test"]
+    unsplit = [d for d in sources if d.split not in ("train", "validation", "test")]
     if unsplit:
-        train_extra, val_extra, test_extra = split_by_document(unsplit)
+        train_extra, val_extra, test_extra = split_by_source(unsplit)
         train.extend(train_extra)
         val.extend(val_extra)
         test.extend(test_extra)
@@ -553,12 +553,12 @@ def expand_gold_curies(db_ids, benchmarker=None, umls_crosswalk=None) -> set[str
 
 # === For cross-dataset deduplication and overlap handling ===
 
-# Sources whose doc id is a PMC id (others use PMID).
+# Sources whose source id is a PMC id (others use PMID).
 _PMC_SOURCES = {"nlmchem", "bioid"}
 
-def canonical_doc_key(doc) -> str:
-    prefix = "PMC" if doc.source in _PMC_SOURCES else "PMID"
-    return f"{prefix}:{doc.doc_id}"
+def canonical_source_key(source) -> str:
+    prefix = "PMC" if source.source in _PMC_SOURCES else "PMID"
+    return f"{prefix}:{source.source_id}"
 
 # Set split priority in case of overlap (default to train)
 _SPLIT_RANK = {"test": 3, "validation": 2, "train": 1}
@@ -567,27 +567,27 @@ def _pick_split(splits) -> str:
     return max((s for s in splits if s in _SPLIT_RANK),
                key=lambda s: _SPLIT_RANK[s], default="train")
 
-def resolve_cross_dataset_overlap(docs, merge: bool = True,
+def resolve_cross_dataset_overlap(sources, merge: bool = True,
                                   verbose: bool = True):
-    """Handle cases where multiple documents refer to the same source article. Make
-    sure each canonical document is assigned to one split and identical-offset mentions
+    """Handle cases where multiple sources refer to the same source article. Make
+    sure each canonical source is assigned to one split and identical-offset mentions
     are merged into one.
     """
     by_key = defaultdict(list)
-    for d in docs:
-        by_key[canonical_doc_key(d)].append(d)
+    for d in sources:
+        by_key[canonical_source_key(d)].append(d)
 
-    n_overlap = n_doc_merged = n_collapsed = n_multi_gold = n_reassigned = 0
-    out_docs = []
+    n_overlap = n_source_merged = n_collapsed = n_multi_gold = n_reassigned = 0
+    out_sources = []
 
     for key, dlist in by_key.items():
         split = _pick_split([d.split for d in dlist])
         n_reassigned += sum(1 for d in dlist if d.split != split)
         if len(dlist) > 1:
             n_overlap += 1
-            n_doc_merged += len(dlist) - 1
+            n_source_merged += len(dlist) - 1
 
-        # Gather mentions across all docs for an article
+        # Gather mentions across all sources for an article
         all_mentions = [m for d in dlist for m in d.mentions]
         sources = sorted({d.source for d in dlist})
 
@@ -618,8 +618,8 @@ def resolve_cross_dataset_overlap(docs, merge: bool = True,
         else:
             mentions = all_mentions
 
-        out_docs.append(DocumentExample(
-            doc_id=key,
+        out_sources.append(SourceExample(
+            source_id=key,
             mentions=mentions,
             source="+".join(sources),
             split=split,
@@ -627,25 +627,25 @@ def resolve_cross_dataset_overlap(docs, merge: bool = True,
 
     if verbose:
         print(f"[dedup] {n_overlap} articles in >= 2 datasets | "
-              f"{n_doc_merged} docs merged | {n_collapsed} mentions"
+              f"{n_source_merged} sources merged | {n_collapsed} mentions"
               f" collapsed | {n_multi_gold} spans with multi-source gold | "
               f"{n_reassigned} split reassignments (leakage guard)")
 
-    return out_docs
+    return out_sources
 
 
-def report_statistics(examples: list[DocumentExample]) -> dict:
+def report_statistics(examples: list[SourceExample]) -> dict:
     """Print and return summary statistics on the corpus
     """
-    n_docs = len(examples)
+    n_sources = len(examples)
     n_mentions = sum(len(d.mentions) for d in examples)
     type_counts = defaultdict(int)
     n_with_candidates = 0
     n_gold_in_candidates = 0
     total_candidates = 0
 
-    for doc in examples:
-        for m in doc.mentions:
+    for source in examples:
+        for m in source.mentions:
             type_counts[m.entity_type] += 1
             if m.candidates:
                 n_with_candidates += 1
@@ -654,7 +654,7 @@ def report_statistics(examples: list[DocumentExample]) -> dict:
                 n_gold_in_candidates += 1
 
     stats = {
-        "n_docs": n_docs,
+        "n_sources": n_sources,
         "n_mentions": n_mentions,
         "entity_types": dict(type_counts),
         "has_candidates_rate": n_with_candidates / n_mentions if n_mentions else 0,
@@ -662,7 +662,7 @@ def report_statistics(examples: list[DocumentExample]) -> dict:
         "avg_candidates": total_candidates / n_with_candidates if n_with_candidates else 0,
     }
 
-    print(f"Documents: {n_docs}")
+    print(f"Sources: {n_sources}")
     print(f"Mentions: {n_mentions}")
     print(f"Has candidates: {n_with_candidates}/{n_mentions} "
           f"({stats['has_candidates_rate']:.1%})")
@@ -771,7 +771,7 @@ def classify_entity_type_bigbio(dataset: str, type_list, gold_synonyms) -> str:
 
 # --- Register the old names of paths as aliases ---
 # The corpus caches in caches/ were written while this package was still called
-# "joint_disambig", so they store the class paths "joint_disambig.data.DocumentExample"
+# "joint_disambig", so they store the class paths "joint_disambig.data.SourceExample"
 # and "joint_disambig.data.MentionExample" as literals.
 import sys
 import types

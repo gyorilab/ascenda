@@ -12,12 +12,11 @@ python -m ascenda.evaluate \
 from collections import defaultdict
 import pandas as pd
 
-from .data import DocumentExample
-from .embedder import CandidateEmbedder
+from .data import SourceExample
 
 
 def evaluate_predictions(
-    docs: list[DocumentExample],
+    sources: list[SourceExample],
     predictions: dict[str, dict[str, list]],
 ) -> pd.DataFrame:
     """Evaluate a model's predicted re-ranking of candidates by computing
@@ -25,10 +24,10 @@ def evaluate_predictions(
 
     Params:
     -------
-    docs :
-        Held-out set of documents
+    sources :
+        Held-out set of sources
     predictions :
-        Dictionary that maps doc_id: {mention_text: list[ScoredMatch]}
+        Dictionary that maps source_id: {mention_text: list[ScoredMatch]}
 
     Returns:
     --------
@@ -38,12 +37,12 @@ def evaluate_predictions(
     counts = defaultdict(lambda: {"correct": 0, "has_grounding": 0,
                                   "total": 0})
 
-    for doc in docs:
-        doc_preds = predictions.get(doc.doc_id, {})
-        for mention in doc.mentions:
+    for source in sources:
+        source_preds = predictions.get(source.source_id, {})
+        for mention in source.mentions:
             etype = mention.entity_type
             counts[etype]["total"] += 1
-            preds = doc_preds.get(mention.text, mention.candidates)
+            preds = source_preds.get(mention.text, mention.candidates)
             if not preds:
                 continue
             counts[etype]["has_grounding"] += 1
@@ -55,12 +54,12 @@ def evaluate_predictions(
 
 
 def filter_ambiguous_mentions(
-    docs: list[DocumentExample],
+    sources: list[SourceExample],
     max_score_gap: float = 0.05,
     min_candidates: int = 2,
     min_top_score: float = 0.3,
-) -> list[DocumentExample]:
-    """Filter documents to only include mentions where Gilda's candidate
+) -> list[SourceExample]:
+    """Filter sources to only include mentions where Gilda's candidate
     list is genuinely ambiguous. A mention is considered ambiguous when it
     has at least `min_candidates` candidates, the gap between the 1st and 2nd
     candidate scores is at most `max_score_gap`, and the top candidate score
@@ -68,8 +67,8 @@ def filter_ambiguous_mentions(
 
     Params:
     ------
-    docs :
-        List of DocumentExample instances.
+    sources :
+        List of SourceExample instances.
     max_score_gap :
         Maximum allowed difference between the top two candidate scores.
     min_candidates :
@@ -79,16 +78,16 @@ def filter_ambiguous_mentions(
 
     Returns:
     --------
-    list[DocumentExample]
-        Filtered documents containing only ambiguous mentions. Documents
+    list[SourceExample]
+        Filtered sources containing only ambiguous mentions. Sources
         with no remaining mentions are dropped.
     """
     total_mentions = 0
     kept_mentions = 0
     filtered = []
-    for doc in docs:
+    for source in sources:
         amb_mentions = []
-        for m in doc.mentions:
+        for m in source.mentions:
             total_mentions += 1
             if len(m.candidates) < min_candidates:
                 continue
@@ -99,24 +98,24 @@ def filter_ambiguous_mentions(
                 amb_mentions.append(m)
                 kept_mentions += 1
         if amb_mentions:
-            filtered.append(DocumentExample(
-                doc_id=doc.doc_id,
+            filtered.append(SourceExample(
+                source_id=source.source_id,
                 mentions=amb_mentions,
             ))
     print(f"Ambiguity filter: kept {kept_mentions}/{total_mentions} mentions "
-          f"({kept_mentions/total_mentions:.1%}) across {len(filtered)} docs "
+          f"({kept_mentions/total_mentions:.1%}) across {len(filtered)} sources "
           f"(gap<={max_score_gap}, candidates>={min_candidates}, "
           f"top>={min_top_score})")
     return filtered
 
 
-def evaluate_baseline(docs: list[DocumentExample]) -> pd.DataFrame:
+def evaluate_baseline(sources: list[SourceExample]) -> pd.DataFrame:
     """"Evaluate Gilda's default pre-disambiguation candidate ranking.
     """
     counts = defaultdict(lambda: {"correct": 0, "has_grounding": 0, "total": 0})
 
-    for doc in docs:
-        for mention in doc.mentions:
+    for source in sources:
+        for mention in source.mentions:
             etype = mention.entity_type
             counts[etype]["total"] += 1
             if not mention.candidates:
@@ -166,7 +165,7 @@ def _counts_to_df(counts: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def comparison_table(docs, predictions, model_col="Attn F1",
+def comparison_table(sources, predictions, model_col="Attn F1",
                      total_label="Total", add_average_row=True):
     """Generates a comparison table with per entity_type Total, Gilda F1,
     <model_col>, Gains, Losses, Net, G/L, and Net %.
@@ -178,9 +177,9 @@ def comparison_table(docs, predictions, model_col="Attn F1",
     def curie(c):
         return f"{c.term.db}:{c.term.id}"
 
-    for doc in docs:
-        dp = predictions.get(doc.doc_id, {})
-        for m in doc.mentions:
+    for source in sources:
+        dp = predictions.get(source.source_id, {})
+        for m in source.mentions:
             r = agg[m.entity_type]
             r["total"] += 1
             base = m.candidates
@@ -247,16 +246,16 @@ def comparison_table(docs, predictions, model_col="Attn F1",
     return pd.DataFrame(rows)
 
 
-def filter_docs_by_source(docs, src):
-    """Handles merged documents whose source is a merged string
+def filter_sources_by_origin(sources, src):
+    """Handles merged source whose origin is a merged string
     (e.g. 'bc5cdr+ncbi_disease').
     """
     out = []
-    for d in docs:
-        ms = [m for m in d.mentions if src in m.source_datasets]
+    for s in sources:
+        ms = [m for m in s.mentions if src in m.source_datasets]
         if ms:
-            out.append(DocumentExample(doc_id=d.doc_id, mentions=ms,
-                                       source=d.source, split=d.split))
+            out.append(SourceExample(source_id=s.source_id, mentions=ms,
+                                       source=s.source, split=s.split))
     return out
 
 
@@ -264,15 +263,20 @@ def filter_docs_by_source(docs, src):
 
 if __name__ == "__main__":
     import argparse
-    import os
+    import json
+    import pickle
 
-    _CACHES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "caches")
+    from .data import load_corpus, make_splits
+    from .train import (DEFAULT_CORPUS_CACHE, DEFAULT_DATASETS,
+                        DEFAULT_ENTITY_CACHE, load_model, predict_source)
+    from .__init__ import DEFAULT_MODEL_PATH
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", default=None,
-                        help="Path to trained attention model")
-    parser.add_argument("--embedding-cache",
-                        default=os.path.join(_CACHES, "embedding_cache_final.pkl"))
+    parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH,
+                        help="mean-field model checkpoint")
+    parser.add_argument("--embedding-cache", default=DEFAULT_ENTITY_CACHE)
+    parser.add_argument("--corpus-cache", default=DEFAULT_CORPUS_CACHE)
+    parser.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS)
     parser.add_argument("--equivalences", default=None)
     parser.add_argument("--ambiguous-only", action="store_true",
                         help="Evaluate only on ambiguous mentions")
@@ -285,32 +289,23 @@ if __name__ == "__main__":
     parser.add_argument("--min-top-score", type=float, default=0.3,
                         help="Min score for the top candidate "
                              "(if --ambiguous-only)")
+    parser.add_argument("--headline", action="store_true")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--datasets", nargs="+", default=["bioid"])
-    parser.add_argument("--corpus-cache", default=None)
-    parser.add_argument("--context-cache", default=None,
-                        help="per-document context embedding cache (for "
-                             "wants_context=True models)")
     args = parser.parse_args()
-
-    import json
-    from .data import load_corpus, make_splits
-    from .train import (precompute_embeddings, precompute_context_embeddings,
-                        predict_document, load_model)
 
     equivalences = {}
     if args.equivalences:
         with open(args.equivalences) as f:
             equivalences = json.load(f)
 
-    docs = load_corpus(args.datasets, equivalences=equivalences,
+    sources = load_corpus(args.datasets, equivalences=equivalences,
                        merged_cache=args.corpus_cache)
-    _, _, test_docs = make_splits(docs)
-    full_test_docs = test_docs
+    _, _, test_sources = make_splits(sources)
+    full_test_sources = test_sources
 
     if args.ambiguous_only:
-        test_docs = filter_ambiguous_mentions(
-            test_docs,
+        test_sources = filter_ambiguous_mentions(
+            test_sources,
             max_score_gap=args.max_score_gap,
             min_candidates=args.min_candidates,
             min_top_score=args.min_top_score,
@@ -318,39 +313,30 @@ if __name__ == "__main__":
 
     # Gilda baseline
     print("\n=== Gilda Baseline ===")
-    print(evaluate_baseline(test_docs).to_markdown(index=False))
+    print(evaluate_baseline(test_sources).to_markdown(index=False))
 
-    # Attention-based model
-    if args.model_path:
-        infer_docs = full_test_docs if args.headline else test_docs
-        embedder = CandidateEmbedder(device=args.device)
-        cache = precompute_embeddings(infer_docs, embedder,
-                                      args.embedding_cache)
-        model = load_model(args.model_path, device=args.device)
+    infer_sources = full_test_sources if args.headline else test_sources
+    with open(args.embedding_cache, "rb") as f:
+        cache = pickle.load(f)
+    print(f"Loaded {len(cache)} entity embeddings from {args.embedding_cache}")
+    model = load_model(args.model_path, device=args.device)
 
-        context_cache = None
-        if getattr(model, "wants_context", False):
-            context_cache = precompute_context_embeddings(
-                infer_docs, embedder, args.context_cache)
+    predictions = {}
+    for source in infer_sources:
+        predictions[source.source_id] = predict_source(
+            source, cache, model, device=args.device)
 
-        predictions = {}
-        for doc in infer_docs:
-            predictions[doc.doc_id] = predict_document(
-                doc, cache, model, device=args.device,
-                context_cache=context_cache,
-            )
+    model_df = evaluate_predictions(test_sources, predictions)
+    print("\n=== Attention Model ===")
+    print(model_df.to_markdown(index=False))
 
-        model_df = evaluate_predictions(test_docs, predictions)
-        print("\n=== Attention Model ===")
-        print(model_df.to_markdown(index=False))
+    print("\n=== Combined (all sources) ===")
+    print(comparison_table(test_sources, predictions).to_markdown(index=False))
 
-        print("\n=== Combined (all sources) ===")
-        print(comparison_table(test_docs, predictions).to_markdown(index=False))
-
-        print("\n=== Per source ===")
-        srcs = sorted({s for d in test_docs for m in d.mentions
-                       for s in m.source_datasets})
-        for src in srcs:
-            sub = filter_docs_by_source(test_docs, src)
-            print(f"\n[{src}]")
-            print(comparison_table(sub, predictions).to_markdown(index=False))
+    print("\n=== Per source ===")
+    srcs = sorted({s for d in test_sources for m in d.mentions
+                   for s in m.source_datasets})
+    for src in srcs:
+        sub = filter_sources_by_origin(test_sources, src)
+        print(f"\n[{src}]")
+        print(comparison_table(sub, predictions).to_markdown(index=False))
