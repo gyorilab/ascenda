@@ -1,17 +1,19 @@
 """Joint disambiguation module for Gilda that uses PubMedBERT embeddings and
 self-attention.
 
-Candidates are embedded using their full name and namespace label via a frozen
-PubMedBERT model, concatenated with a 10-d status/string-match vector, and
-re-ranked jointly based on their representations after being passed through a
-stack of transformer blocks.
+Candidates and mentions are embedded using a frozen PubMedBERT model, then
+rounds of self-attention allows mentions to update their beliefs over their
+candidates using other mentions from the same source.
 
-One forward pass takes all mentions from a single document/source, lets them
-attend to each others vector representations (as well as a per-document CTX
-token built from embedding all mention spans as one string), and infers
-per-mention which candidate should be ranked highest.
+One forward pass takes all mentions from a single source, lets them attend
+to each others vector representations, and infers per-mention which
+candidate should be ranked highest.
 """
+import os
 from typing import Optional
+
+_MODELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+DEFAULT_MODEL_PATH = os.path.join(_MODELS, "final_model_best_checkpoint_seed0.pt")
 
 _model = None
 _embedder = None
@@ -42,36 +44,27 @@ def disambiguate(
     dict[str, list[ScoredMatch]]
         Same structure as mention_candidates but with re-ranked candidates.
     """
-    global _model, _embedder
+    global _model, _embedder, _jr
 
     if model_path is None:
-        raise ValueError("model_path is required (no bundled model yet)")
+        model_path = DEFAULT_MODEL_PATH
+    if not os.path.exists(model_path):
+        raise ValueError(f"No checkpoint at {model_path!r}")
 
     if _model is None:
-        import torch
-        from .embedder import CandidateEmbedder
+        from gilda.grounder import Grounder
+        from .embedder import EntityEmbedder
         from .train import load_model
 
         _model = load_model(model_path, device=device)
-        ckpt = torch.load(model_path, map_location=device, weights_only=True)
-
-        # Use rich embeddings if the checkpoint was trained with them
-        embedding_mode = ckpt.get("embedding_mode", "plain")
-        if embedding_mode == "rich":
-            from gilda.grounder import Grounder
-            _embedder = CandidateEmbedder(device=device, grounder=Grounder())
-        else:
-            _embedder = CandidateEmbedder(device=device)
+        _embedder = EntityEmbedder(device=device, grounder=Grounder())
 
     # Re-rank with a shared JointReranker
     from .rerank import JointReranker
-    global _jr
     if _jr is None:
-        _jr = JointReranker(_model, grounder=None, device=device, cache=_cache, embedder=_embedder)
+        _jr = JointReranker(_model, grounder=None, device=device, cache=_cache,
+                            embedder=_embedder)
 
     texts = list(mention_candidates.keys())
-    ctx = None
-    if getattr(_model, "wants_context", False) and texts:
-        ctx = _embedder.embed_text(", ".join(dict.fromkeys(texts)), max_length=512)
-    ranked = _jr.rerank([mention_candidates[t] for t in texts], context_emb=ctx)
+    ranked = _jr.rerank([mention_candidates[t] for t in texts], texts)
     return dict(zip(texts, ranked))
