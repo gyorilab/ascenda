@@ -7,10 +7,10 @@ from dataclasses import dataclass
 
 
 @dataclass
-class DocTensors:
-    """Index-only view of one document.
+class SourceTensors:
+    """Index-only view of one source.
     """
-    doc_id: str
+    source_id: str
     ment_idx: torch.Tensor
     cand_idx: torch.Tensor
     cand_mask: torch.Tensor
@@ -33,14 +33,14 @@ def build_banks(mention_vecs, embedding_cache):
     return mention_bank, entity_bank, entity_row, mention_row
 
 
-def build_doc_tensors(docs, entity_row, mention_row) -> list[DocTensors]:
-    """One DocTensors per document that has at least one mention with a candidate.
+def build_source_tensors(sources, entity_row, mention_row) -> list[SourceTensors]:
+    """One SourceTensors per source that has at least one mention with a candidate.
     """
     built, skipped = [], 0
-    for d in docs:
+    for d in sources:
         rows, cands, pos, mpos = [], [], [], []
         for i, m in enumerate(d.mentions):
-            key = (d.doc_id, i)
+            key = (d.source_id, i)
             if not m.candidates or key not in mention_row:
                 continue
             idx = [entity_row.get((c.term.db, c.term.id)) for c in m.candidates]
@@ -62,8 +62,8 @@ def build_doc_tensors(docs, entity_row, mention_row) -> list[DocTensors]:
             cand_idx[r, :len(ci)] = torch.tensor(ci, dtype=torch.long)
             cand_mask[r, :len(ci)] = True
             pos_mask[r, :len(pi)] = torch.tensor(pi, dtype=torch.bool)
-        built.append(DocTensors(
-            d.doc_id, torch.tensor(rows, dtype=torch.long), cand_idx, cand_mask,
+        built.append(SourceTensors(
+            d.source_id, torch.tensor(rows, dtype=torch.long), cand_idx, cand_mask,
             pos_mask, cand_mask.sum(1), tuple(mpos)))
     if skipped:
         print(f"Note: {skipped} mentions were dropped (candidate missing from the "

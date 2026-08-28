@@ -13,7 +13,7 @@ from .data import NS_TYPE, load_corpus, make_splits
 from .embedder import (EntityEmbedder, DEFAULT_MODEL, ORGANISM_NAMES,
                        build_embedding_text)
 from .model import JointDisambiguator, compute_loss
-from .tensors import build_banks, build_doc_tensors, gather
+from .tensors import build_banks, build_source_tensors, gather
 
 DEFAULT_DATASETS = ["bioid", "bc5cdr", "nlmchem", "ncbi_disease", "gnormplus",
                     "medmentions_st21pv"]
@@ -49,11 +49,11 @@ def embed_strings_meanpool(enc: EntityEmbedder, texts, batch_size=64,
     return np.concatenate(out, axis=0).astype("float32")
 
 
-def get_canonical_term(docs):
+def get_canonical_term(sources):
     """Create dict so that there's only one term per (db, id).
     """
     best = {}
-    for d in docs:
+    for d in sources:
         for m in d.mentions:
             for c in m.candidates or ():
                 t = c.term
@@ -65,7 +65,7 @@ def get_canonical_term(docs):
     return {k: v[1] for k, v in best.items()}
 
 
-def precompute_candidate_vectors(docs, cache_path, device="cpu") -> dict:
+def precompute_candidate_vectors(sources, cache_path, device="cpu") -> dict:
     """Returns the dict {(db, id): float32[768]} of PubMedBERT embeddings for candidates.
     """
     if cache_path and os.path.exists(cache_path):
@@ -76,7 +76,7 @@ def precompute_candidate_vectors(docs, cache_path, device="cpu") -> dict:
 
     from gilda.grounder import Grounder
     enc = EntityEmbedder(model_name=DEFAULT_MODEL, device=device, grounder=Grounder())
-    terms = get_canonical_term(docs)
+    terms = get_canonical_term(sources)
     ids = sorted(terms)
     texts = [build_embedding_text(terms[k], enc.grounder) for k in ids]
     print(f"Embedding {len(texts)} unique candidates...")
@@ -91,8 +91,8 @@ def precompute_candidate_vectors(docs, cache_path, device="cpu") -> dict:
     return cache
 
 
-def precompute_mention_vectors(docs, device="cpu") -> dict:
-    """Returns the dict {(doc_id, mention_idx): float32[768]} of PubMedBERT embeddings
+def precompute_mention_vectors(sources, device="cpu") -> dict:
+    """Returns the dict {(source_id, mention_idx): float32[768]} of PubMedBERT embeddings
     for entity mentions.
     """
     if os.path.exists(DEFAULT_MENTION_CACHE):
@@ -102,10 +102,10 @@ def precompute_mention_vectors(docs, device="cpu") -> dict:
         return cache
 
     need = {}
-    for d in docs:
+    for d in sources:
         for i, m in enumerate(d.mentions):
             if m.candidates:
-                need.setdefault(m.text, []).append((d.doc_id, i))
+                need.setdefault(m.text, []).append((d.source_id, i))
 
     out = {}
     if need:
@@ -182,27 +182,27 @@ def get_new_stats():
 
 # === For model training ===
 
-def get_env_labels(docs, ns_purity=0.5):
-    """Give each document an environment label based on the composition of its gold
+def get_env_labels(sources, ns_purity=0.5):
+    """Give each source an environment label based on the composition of its gold
     namespaces. For implementing the Variance Risk Extrapolation (V-REx) method.
 
-    For example, if the proportion of gold namespaces in a document that are HGNC
-    exceeds `ns_purity`, then that document is given an environment label of 'ns:gene'.
-    If no namespace proportion exceeds `ns_purity`, a document is labeled as 'ns:mixed'.
-    Documents with no gold labels are labeled 'ns:none'.
+    For example, if the proportion of gold namespaces in a source that are HGNC
+    exceeds `ns_purity`, then that source is given an environment label of 'ns:gene'.
+    If no namespace proportion exceeds `ns_purity`, a source is labeled as 'ns:mixed'.
+    Sources with no gold labels are labeled 'ns:none'.
     """
     out = {}
-    for d in docs:
+    for s in sources:
         hist = collections.Counter()
-        for m in d.mentions:
+        for m in s.mentions:
             if m.gold_index is not None and m.candidates:
                 hist[NS_TYPE.get(m.candidates[m.gold_index].term.db, "other")] += 1
         n = sum(hist.values())
         if not n:
-            out[d.doc_id] = "ns:none"
+            out[s.source_id] = "ns:none"
             continue
         top, c = hist.most_common(1)[0]
-        out[d.doc_id] = f"ns:{top}" if c / n >= ns_purity else "ns:mixed"
+        out[s.source_id] = f"ns:{top}" if c / n >= ns_purity else "ns:mixed"
     return out
 
 
@@ -217,7 +217,7 @@ def get_round_weights(n_out, round0_weight):
 def train(model, train_dt, val_dt, mention_bank, entity_bank, *, epochs=300, lr=3e-4,
           weight_decay=0.01, grad_accum=8, patience=20, seed=0, device="cpu",
           deep_supervision=True, round0_weight=0.2, w_ctx=0.0,
-          w_orth=0.0, env_of=None, vrex_beta=0.0, vrex_warmup=5, vrex_min_docs=50):
+          w_orth=0.0, env_of=None, vrex_beta=0.0, vrex_warmup=5, vrex_min_sources=50):
     device = torch.device(device)
     model = model.to(device)
     mention_bank = mention_bank.to(device)
@@ -229,27 +229,27 @@ def train(model, train_dt, val_dt, mention_bank, entity_bank, *, epochs=300, lr=
     patience_counter = 0
     rng = random.Random(seed)
 
-    # Establish V-REx environments. Keep those with >= `vrex_min_docs`, drop 'ns:none'.
+    # Establish V-REx environments. Keep those with >= `vrex_min_sources`, drop 'ns:none'.
     # Dropped environments still contribute to the mean risk, but not variance risk.
     vrex_envs = set()
     if vrex_beta > 0:
         if env_of is None:
             raise ValueError("vrex_beta > 0 requires env_of")
-        env_n = collections.Counter(env_of[dt.doc_id] for dt in train_dt)
+        env_n = collections.Counter(env_of[dt.source_id] for dt in train_dt)
         env_n.pop("ns:none", None)
-        vrex_envs = {k for k, c in env_n.items() if c >= vrex_min_docs}
+        vrex_envs = {k for k, c in env_n.items() if c >= vrex_min_sources}
         print(f"[v-rex] beta={vrex_beta} warmup={vrex_warmup} "
-              f"min_docs={vrex_min_docs}")
+              f"min_sources={vrex_min_sources}")
         print(f"[v-rex] {len(vrex_envs)} environments kept: "
               + ", ".join(f"{k}({env_n[k]})" for k, _ in env_n.most_common()
                           if k in vrex_envs))
         dropped = [k for k in env_n if k not in vrex_envs]
         if dropped:
-            print(f"[v-rex] dropped (<{vrex_min_docs} docs): "
+            print(f"[v-rex] dropped (<{vrex_min_sources} sources): "
                   + ", ".join(f"{k}({env_n[k]})" for k in dropped))
 
     def penalize_vrex(win, beta_now):
-        """Applies the V-REx penalty to the objective for one 'batch' of documents.
+        """Applies the V-REx penalty to the objective for one 'batch' of sources.
 
         Returns the tuple (objective, variance) for one gradient-accumulation window
         (batch) where objective = mean risk over all losses + beta_now * variance over
@@ -315,7 +315,7 @@ def train(model, train_dt, val_dt, mention_bank, entity_bank, *, epochs=300, lr=
 
             # --- apply variance penalty ---
             if vrex_beta > 0:  # i.e., if vrex is ON
-                window.append((env_of[dt.doc_id], loss))
+                window.append((env_of[dt.source_id], loss))
                 if accum < grad_accum:
                     continue
                 total, v = penalize_vrex(window, beta_now)
@@ -391,11 +391,11 @@ def train(model, train_dt, val_dt, mention_bank, entity_bank, *, epochs=300, lr=
 
 
 @torch.no_grad()
-def evaluate(model, doc_tensors, mention_bank, entity_bank, device="cpu"):
+def evaluate(model, source_tensors, mention_bank, entity_bank, device="cpu"):
     device = torch.device(device)
     model = model.to(device).eval()
     stats = get_new_stats()
-    for dt in doc_tensors:
+    for dt in source_tensors:
         log_probs, aux = model_forward(model, dt, mention_bank, entity_bank, device,
                               return_aux=True)
         accumulate_stats(stats, log_probs, dt, aux)
@@ -447,16 +447,16 @@ def get_reranker(model, entity_cache, device):
     return jr
 
 
-def predict_source(doc, entity_cache: dict, model, device: str = "cpu") -> dict:
+def predict_source(source, entity_cache: dict, model, device: str = "cpu") -> dict:
     """Run inference on a single source and return {mention_text: re-ranked
     ScoredMatch list}.
     """
     jr = get_reranker(model, entity_cache, device)
-    with_cands = [m for m in doc.mentions if m.candidates]
+    with_cands = [m for m in source.mentions if m.candidates]
     ranked = jr.rerank([m.candidates for m in with_cands],
                        [m.text for m in with_cands]) if with_cands else []
     results = {m.text: r for m, r in zip(with_cands, ranked)}
-    for m in doc.mentions:
+    for m in source.mentions:
         results.setdefault(m.text, m.candidates)
     return results
 
@@ -490,12 +490,12 @@ if __name__ == "__main__":
                         help="coefficient for V-REx penalty in loss")
     parser.add_argument("--vrex-warmup", type=int, default=5,
                         help="epochs over which beta ramps linearly from 0")
-    parser.add_argument("--vrex-min-docs", type=int, default=50,
-                        help="drop environments with fewer training docs than this from "
+    parser.add_argument("--vrex-min-sources", type=int, default=50,
+                        help="drop environments with fewer training sources than this from "
                              "the variance term to avoid adding noise")
     parser.add_argument("--vrex-ns-purity", type=float, default=0.5,
-                        help="share of a document's labeled mentions the argmax gold "
-                             "type must hold for the document to be assigned to that "
+                        help="share of a source's labeled mentions the argmax gold "
+                             "type must hold for the source to be assigned to that "
                              "environment instead of ns:mixed")
     parser.add_argument("--w-ctx", type=float, default=0.5,
                    help="weight on the context-only ranking loss: require the trunk to "
@@ -516,23 +516,23 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    docs = load_corpus(args.datasets, merged_cache=args.corpus_cache)
-    train_docs, val_docs, test_docs = make_splits(docs)
-    print(f"docs: {len(train_docs)} train / {len(val_docs)} val / {len(test_docs)} test")
+    sources = load_corpus(args.datasets, merged_cache=args.corpus_cache)
+    train_sources, val_sources, test_sources = make_splits(sources)
+    print(f"sources: {len(train_sources)} train / {len(val_sources)} val / {len(test_sources)} test")
 
-    mention_vecs = precompute_mention_vectors(docs, device=args.device)
-    embedding_cache = precompute_candidate_vectors(docs, args.embedding_cache, device=args.device)
+    mention_vecs = precompute_mention_vectors(sources, device=args.device)
+    embedding_cache = precompute_candidate_vectors(sources, args.embedding_cache, device=args.device)
 
     mention_bank, entity_bank, entity_row, mention_row = build_banks(
         mention_vecs, embedding_cache)
     print(f"banks: mentions {tuple(mention_bank.shape)}  "
           f"entities {tuple(entity_bank.shape)}")
 
-    train_dt = build_doc_tensors(train_docs, entity_row, mention_row)
-    val_dt = build_doc_tensors(val_docs, entity_row, mention_row)
-    test_dt = build_doc_tensors(test_docs, entity_row, mention_row)
+    train_dt = build_source_tensors(train_sources, entity_row, mention_row)
+    val_dt = build_source_tensors(val_sources, entity_row, mention_row)
+    test_dt = build_source_tensors(test_sources, entity_row, mention_row)
     trainable = sum(int((dt.pos_mask.any(1) & (dt.n_cand > 1)).sum()) for dt in train_dt)
-    print(f"doc tensors: {len(train_dt)}/{len(val_dt)}/{len(test_dt)}; "
+    print(f"source tensors: {len(train_dt)}/{len(val_dt)}/{len(test_dt)}; "
           f"{trainable} reachable multi-candidate train mentions")
 
     model = JointDisambiguator(
@@ -546,10 +546,10 @@ if __name__ == "__main__":
                   grad_accum=args.grad_accum, patience=args.patience, seed=args.seed,
                   device=args.device, deep_supervision=not args.no_deep_supervision,
                   round0_weight=args.round0_weight,
-                  env_of=(get_env_labels(train_docs, args.vrex_ns_purity)
+                  env_of=(get_env_labels(train_sources, args.vrex_ns_purity)
                           if args.vrex_beta > 0 else None),
                   vrex_beta=args.vrex_beta, vrex_warmup=args.vrex_warmup,
-                  vrex_min_docs=args.vrex_min_docs, w_ctx=args.w_ctx, w_orth=args.w_orth)
+                  vrex_min_sources=args.vrex_min_sources, w_ctx=args.w_ctx, w_orth=args.w_orth)
 
     for name, dts in (("val", val_dt), ("test", test_dt)):
         print(f"FINAL {name}: {format_stats(evaluate(model, dts, mention_bank, entity_bank, args.device))}")
